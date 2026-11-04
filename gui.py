@@ -519,11 +519,15 @@ class Window(Adw.ApplicationWindow):
         for side in ("top", "bottom", "left", "right"):
             getattr(self.t_view, f"set_{side}_margin")(10)
         self.t_buf.connect("changed", self.on_transcript_edited)
-        # Capture phase, acting on press: the text view's own selection-drag and click gestures would
-        # otherwise cancel a click that moves a pixel (common with touchpads) or lands during a live scroll.
-        click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY, propagation_phase=Gtk.PropagationPhase.CAPTURE)
-        click.connect("pressed", self.on_transcript_clicked)
+        # Decide on press (capture phase, so the text view's own selection drag never starts), act on
+        # release (a popover opened while the button is still held is dismissed by that release). A drag
+        # gesture rather than a click one, because a click is cancelled by a pixel of movement (touchpads)
+        # and the press position is kept, so a live auto-scroll before the release doesn't matter.
+        click = Gtk.GestureDrag(button=Gdk.BUTTON_PRIMARY, propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        click.connect("drag-begin", self.on_transcript_pressed)
+        click.connect("drag-end", self.on_transcript_released)
         self.t_view.add_controller(click)
+        self.transcript_press = None
         hover = Gtk.EventControllerMotion()
         hover.connect("motion", self.on_transcript_hover)
         hover.connect("leave", lambda _c: self.t_view.set_cursor_from_name(None))
@@ -1511,7 +1515,7 @@ class Window(Adw.ApplicationWindow):
         self.toast(message)
 
     def toast(self, message, button=None, action=None):
-        t = Adw.Toast(title=message, timeout=5)
+        t = Adw.Toast(title=message, timeout=5, use_markup=False)     # names like "F&B" are not markup
         if button:
             t.set_button_label(button)
             t.connect("button-clicked", lambda _t: action())
@@ -1835,15 +1839,24 @@ class Window(Adw.ApplicationWindow):
     def on_transcript_hover(self, _ctl, x, y):
         self.t_view.set_cursor_from_name("pointer" if self.transcript_hit(x, y) else None)
 
-    def on_transcript_clicked(self, gesture, n_press, x, y):
-        hit = self.transcript_hit(x, y)
-        if hit is None:
-            gesture.set_state(Gtk.EventSequenceState.DENIED)    # ordinary text: normal selecting/editing
+    def on_transcript_pressed(self, gesture, x, y):
+        event = gesture.get_current_event()
+        if event is not None and event.get_surface() != self.get_surface():
+            gesture.set_state(Gtk.EventSequenceState.DENIED)    # a press inside the popover, not on the text
             return
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)       # keep the text view from starting a selection
-        if n_press > 1:
-            return      # the first press of a double-click already acted
-        kind, line, m = hit
+        hit = self.transcript_hit(x, y)
+        self.transcript_press = (hit, x, y) if hit else None
+        # claim speaker names / timestamps so pressing them never starts a text selection;
+        # leave ordinary text to the text view for normal selecting and editing
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED if hit else Gtk.EventSequenceState.DENIED)
+
+    def on_transcript_released(self, _gesture, _dx, _dy):
+        press, self.transcript_press = self.transcript_press, None
+        if press is not None:
+            (kind, line, m), x, y = press
+            self.on_transcript_clicked(kind, line, m, x, y)
+
+    def on_transcript_clicked(self, kind, line, m, x, y):
         if kind == "time":
             if self.player is not None and getattr(self, "playing_label", None) == m.group(1):
                 self.stop_playback()
@@ -1877,16 +1890,43 @@ class Window(Adw.ApplicationWindow):
             note.add_css_class("dim-label")
             box.append(note)
         learned = voices.load()
+        # The people list scrolls: a popover taller than the room around the click can't be placed,
+        # and GTK then closes it the moment it opens (this is what broke once there were ~15 speakers).
+        people_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        buttons = []
         for person in people:
             label = person["name"] + ("  ✓" if person["name"] == current else "")
             b = Gtk.Button(label=label)
             b.add_css_class("flat")
             b.get_child().set_xalign(0)
+            b.get_child().set_ellipsize(Pango.EllipsizeMode.END)
             tip = [person.get("email") or "", "Voice learned" if person["name"] in learned else ""]
             if any(tip):
                 b.set_tooltip_text(" · ".join(t for t in tip if t))
             b.connect("clicked", lambda _b, name=person["name"]: self.assign_speaker(line, name, follow.get_active()))
-            box.append(b)
+            people_box.append(b)
+            buttons.append((f"{person['name']} {person.get('email') or ''}".lower(), b))
+        search = None
+        if len(people) > 6:
+            search = Gtk.SearchEntry(placeholder_text="Find a speaker")
+
+            def filter_people(entry):
+                words = entry.get_text().lower().split()
+                for haystack, b in buttons:
+                    b.set_visible(all(w in haystack for w in words))
+
+            def pick_first(_entry):
+                first = next((b for _h, b in buttons if b.get_visible()), None)
+                if first is not None:
+                    first.emit("clicked")
+            search.connect("search-changed", filter_people)
+            search.connect("activate", pick_first)
+            search.connect("stop-search", lambda _e: self.speaker_popover.popdown())     # Escape
+            box.append(search)
+        if people:
+            box.append(Gtk.ScrolledWindow(child=people_box, hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                          propagate_natural_height=True, max_content_height=300,
+                                          min_content_width=240))
         box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
         for name, caption in (("You", "You (your microphone)"), ("Them", "Them (unknown)")):
             b = Gtk.Button(label=caption + ("  ✓" if name == current else ""))
@@ -1903,6 +1943,8 @@ class Window(Adw.ApplicationWindow):
         self.speaker_popover.set_child(box)
         self.speaker_popover.set_pointing_to(rect)
         self.speaker_popover.popup()
+        if search is not None:
+            search.grab_focus()
 
     def assign_speaker(self, line, name, follow=False):
         """Give transcript line `line` to `name`; with `follow`, also every line of that detected speaker
