@@ -519,9 +519,15 @@ class Window(Adw.ApplicationWindow):
         for side in ("top", "bottom", "left", "right"):
             getattr(self.t_view, f"set_{side}_margin")(10)
         self.t_buf.connect("changed", self.on_transcript_edited)
-        click = Gtk.GestureClick()
-        click.connect("released", self.on_transcript_clicked)
+        # Capture phase, acting on press: the text view's own selection-drag and click gestures would
+        # otherwise cancel a click that moves a pixel (common with touchpads) or lands during a live scroll.
+        click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY, propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        click.connect("pressed", self.on_transcript_clicked)
         self.t_view.add_controller(click)
+        hover = Gtk.EventControllerMotion()
+        hover.connect("motion", self.on_transcript_hover)
+        hover.connect("leave", lambda _c: self.t_view.set_cursor_from_name(None))
+        self.t_view.add_controller(hover)
         self.t_stack.add_named(Gtk.ScrolledWindow(child=self.t_view, vexpand=True), "text")
 
         hint_row = Gtk.Box(spacing=8)
@@ -1145,7 +1151,8 @@ class Window(Adw.ApplicationWindow):
             self.t_buf.insert(end(), line + "\n")
         self.loading_transcript = False
         if live:
-            mark = self.t_buf.create_mark(None, end(), False)
+            mark = self.t_buf.get_mark("live-end") or self.t_buf.create_mark("live-end", end(), False)
+            self.t_buf.move_mark(mark, end())
             self.t_view.scroll_to_mark(mark, 0.0, False, 0.0, 0.0)
 
     def show_transcript_file(self, folder):
@@ -1806,26 +1813,43 @@ class Window(Adw.ApplicationWindow):
         m = SCREEN_RE.match(self.t_buf.get_text(start, end, False))
         return (start, end, m) if m else None
 
-    def on_transcript_clicked(self, _gesture, _n_press, x, y):
+    def transcript_hit(self, x, y):
+        """What a point on the transcript (widget coords) is over: ("time"|"speaker", line, match), or None."""
         bx, by = self.t_view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
         ok, it = self.t_view.get_iter_at_location(bx, by)
         if not ok:
-            return
+            return None
         line = it.get_line()
         info = self.line_info(line)
         if info is None:
-            return
+            return None
         start, _end, m = info
         col = it.get_offset() - start.get_offset()
         if col < len(m.group(1)):
+            return "time", line, m
+        who_start = len(m.group(1)) + 2
+        if who_start - 1 <= col <= who_start + len(m.group(2)):     # the name plus the space either side
+            return "speaker", line, m
+        return None
+
+    def on_transcript_hover(self, _ctl, x, y):
+        self.t_view.set_cursor_from_name("pointer" if self.transcript_hit(x, y) else None)
+
+    def on_transcript_clicked(self, gesture, n_press, x, y):
+        hit = self.transcript_hit(x, y)
+        if hit is None:
+            gesture.set_state(Gtk.EventSequenceState.DENIED)    # ordinary text: normal selecting/editing
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)       # keep the text view from starting a selection
+        if n_press > 1:
+            return      # the first press of a double-click already acted
+        kind, line, m = hit
+        if kind == "time":
             if self.player is not None and getattr(self, "playing_label", None) == m.group(1):
                 self.stop_playback()
             else:
                 self.play_line(line)
             return
-        who_start = len(m.group(1)) + 2
-        if not who_start <= col <= who_start + len(m.group(2)):
-            return      # clicked the text, not the speaker name
         if self.viewing is not None:
             self.toast("This earlier transcript is read-only. Press “Use this version” to change its speakers.")
             return
