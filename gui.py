@@ -23,6 +23,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 import callwatch  # noqa: E402
 import chat  # noqa: E402
 import meetings  # noqa: E402
+import procstats  # noqa: E402
 import speakers  # noqa: E402
 import tray  # noqa: E402
 import voices  # noqa: E402
@@ -39,11 +40,11 @@ ENGINES = [
      "Fast and light: transcribes live while using a small share of two CPU cores. "
      "English and 24 European languages, detected automatically.", 0.2),
     ("Whisper small", "whisper", "small",
-     "Urdu, Arabic, Hindi, Chinese and ~90 more. Too heavy to run during a call on this laptop, so it only "
-     "records during the call and transcribes after you stop (takes roughly as long as the meeting).", 1.0),
+     "Urdu, Arabic, Hindi, Chinese and ~90 more. Transcribes live using about 4 CPU cores while people speak "
+     "(around 5× faster than speech on this laptop).", 0.25),
     ("Whisper medium", "whisper", "medium",
-     "Other languages, more accurate than Whisper small but 2–3× slower after the call. "
-     "Downloads 1.5 GB the first time.", 2.5),
+     "More accurate than Whisper small, still live, but only about 2× faster than speech, so during long "
+     "stretches of talk it may fall a little behind and catch up in pauses. Downloads 1.5 GB the first time.", 0.5),
 ]
 LANGUAGES = [
     ("Detect automatically", ""), ("English", "en"), ("Urdu", "ur"), ("Arabic", "ar"), ("Hindi", "hi"),
@@ -83,6 +84,11 @@ CSS = """
                     box-shadow: 0 1px 2px rgba(0,0,0,0.12); }
 .bubble-author { font-size: 11px; font-weight: 700; }
 .meeting-title { font-size: 20px; font-weight: 800; }
+.model-tag > button { min-height: 26px; padding: 0 12px; border-radius: 999px; font-size: 12px; font-weight: 600;
+                      background: alpha(var(--accent-bg-color), 0.14); color: var(--accent-color); }
+.model-tag.earlier > button { background: alpha(var(--warning-bg-color), 0.2); color: var(--warning-color); }
+.version-bar { padding: 8px 12px; }
+.version-row { padding: 4px 6px; }
 """
 
 
@@ -188,6 +194,10 @@ class Window(Adw.ApplicationWindow):
         self.bookmarks = []
         self.bm_rows = []
         self.player = None
+        self.usage = None           # procstats.Usage for the running recorder
+        self.run_model = None       # model id the running recorder uses
+        self.switching = None       # (model id, progress text) while a live model switch is loading
+        self.viewing = None         # earlier transcript version shown read-only, or None for the current one
         self.export_dialog = None
         self.retx_dialog = None
 
@@ -303,6 +313,18 @@ class Window(Adw.ApplicationWindow):
         return view
 
     def build_title(self):
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        col.append(self.build_title_row())
+        self.version_popover = Gtk.Popover()
+        self.model_tag = Gtk.MenuButton(popover=self.version_popover, always_show_arrow=True,
+                                        halign=Gtk.Align.START, visible=False)
+        self.model_tag.add_css_class("model-tag")
+        self.model_tag.add_css_class("flat")
+        self.model_tag.set_create_popup_func(self.fill_version_popover)
+        col.append(self.model_tag)
+        return col
+
+    def build_title_row(self):
         row = Gtk.Box(spacing=8)
         self.title_label = Gtk.EditableLabel(text="New meeting", hexpand=True)
         self.title_label.add_css_class("meeting-title")
@@ -345,9 +367,27 @@ class Window(Adw.ApplicationWindow):
         self.them_bar, self.them_note = self.add_meter("Meeting audio (other people)")
         self.you_bar, self.you_note = self.add_meter("Your microphone")
         card.append(self.meters)
+
+        self.usage_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, visible=False)
+        self.usage_box.set_tooltip_text(
+            "Counts the recorder and the audio tools it runs (parec, ffmpeg). It runs at low priority, so your "
+            "meeting app always gets the CPU first.")
+        heading = Gtk.Label(label="Computer resources used by transcription", xalign=0)
+        heading.add_css_class("heading")
+        self.usage_box.append(heading)
+        self.cpu_bar, self.cpu_note = self.add_meter("Processor (CPU)", self.usage_box)
+        self.mem_bar, self.mem_note = self.add_meter("Memory (RAM)", self.usage_box)
+        for bar in (self.cpu_bar, self.mem_bar):
+            for name in ("low", "high", "full"):    # plain fill: these colour "low" as bad, like a battery
+                bar.remove_offset_value(name)
+        self.sys_note = Gtk.Label(xalign=0, wrap=True)
+        self.sys_note.add_css_class("meter-label")
+        self.sys_note.add_css_class("dim-label")
+        self.usage_box.append(self.sys_note)
+        card.append(self.usage_box)
         return card
 
-    def add_meter(self, title):
+    def add_meter(self, title, parent=None):
         row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         top = Gtk.Box(spacing=10)
         label = Gtk.Label(label=title, xalign=0, hexpand=True)
@@ -360,7 +400,7 @@ class Window(Adw.ApplicationWindow):
         bar = Gtk.LevelBar(min_value=0, max_value=1, hexpand=True)
         row.append(top)
         row.append(bar)
-        self.meters.append(row)
+        (parent or self.meters).append(row)
         return bar, note
 
     def build_settings(self):
@@ -502,6 +542,26 @@ class Window(Adw.ApplicationWindow):
         self.play_box.append(Gtk.Image(icon_name="audio-speakers-symbolic"))
         self.play_box.append(self.play_label)
         self.play_box.append(stop_play)
+
+        self.version_bar = Gtk.Revealer(reveal_child=False)
+        bar = Gtk.Box(spacing=10)
+        bar.add_css_class("card")
+        bar.add_css_class("version-bar")
+        bar.append(Gtk.Image(icon_name="document-open-recent-symbolic", valign=Gtk.Align.CENTER))
+        self.version_label = Gtk.Label(xalign=0, wrap=True, hexpand=True)
+        bar.append(self.version_label)
+        back = Gtk.Button(label="Back to current", valign=Gtk.Align.CENTER)
+        back.set_tooltip_text("Show the transcript this meeting currently uses")
+        back.connect("clicked", lambda _b: self.show_version(None))
+        use = Gtk.Button(label="Use this version", valign=Gtk.Align.CENTER)
+        use.add_css_class("suggested-action")
+        use.set_tooltip_text("Make this the meeting's transcript again. The current one is kept as an earlier "
+                             "version, so you can switch back at any time.")
+        use.connect("clicked", lambda _b: self.restore_viewed_version())
+        bar.append(back)
+        bar.append(use)
+        self.version_bar.set_child(bar)
+        t_page.append(self.version_bar)
         t_page.append(hint_row)
         t_page.append(self.play_box)
         t_page.append(self.t_stack)
@@ -627,6 +687,7 @@ class Window(Adw.ApplicationWindow):
         self.timer_label.set_visible(recording)
         self.meters.set_visible(state in ("downloading", "loading", "recording"))
         self.progress.set_visible(state in ("downloading", "finishing"))
+        self.usage_box.set_visible(self.proc is not None)
         self.settings_group.set_sensitive(not busy)
         self.meeting_list.set_sensitive(not busy)
         self.new_btn.set_sensitive(not busy)
@@ -644,6 +705,7 @@ class Window(Adw.ApplicationWindow):
             self.start_btn.set_tooltip_text("Start recording the meeting audio and transcribing it")
         self.start_btn.set_sensitive(state != "finishing" and not self.retranscribing)
         self.refresh_buttons()
+        self.update_tag()
         if self.hooks:
             self.hooks.state_changed()
 
@@ -654,12 +716,13 @@ class Window(Adw.ApplicationWindow):
         have_meeting = self.out_dir is not None and self.out_dir.exists()
         self.copy_t_btn.set_sensitive(has_text)
         self.ask_btn.set_sensitive(has_text and not busy)
-        editable = has_text and not busy and self.out_dir is not None
+        editable = has_text and not busy and self.out_dir is not None and self.viewing is None
         self.t_view.set_editable(editable)
         self.t_view.set_cursor_visible(editable)
         self.edit_hint.set_visible(has_text)
         self.save_status.set_visible(editable)
         self.edit_hint.set_text(
+            "Earlier transcript (read-only). Click a time to hear that moment." if self.viewing is not None else
             "Click a time to hear that moment. Click a speaker name to choose who said it. Click anywhere else to "
             "fix mistakes; changes save automatically (Ctrl+Z undoes)." if editable else
             "Click a time to hear that moment, or a speaker name to choose who is speaking. Text editing opens "
@@ -732,6 +795,8 @@ class Window(Adw.ApplicationWindow):
             return
         save_settings(cfg)
         _, engine, model = ENGINES[cfg["engine"]][:3]
+        self.run_model = meetings.model_id(engine, model)
+        self.leave_version()
         self.out_dir = MEETINGS_DIR / time.strftime("%Y-%m-%d_%H%M%S")
         meetings.save_meta(self.out_dir, started=datetime.datetime.now().isoformat(timespec="seconds"),
                            engine=engine)
@@ -752,7 +817,7 @@ class Window(Adw.ApplicationWindow):
         self.retranscribing = False
         self.banner.set_revealed(False)
         self.stack.set_visible_child_name("transcript")
-        cmd += ["--out", str(self.out_dir), "--engine", engine]
+        cmd += ["--out", str(self.out_dir), "--engine", engine, "--live", "--control"]
         if engine == "whisper":
             cmd += ["--model", model, "--language", cfg["language"]]
         if not cfg["system"]:
@@ -771,11 +836,18 @@ class Window(Adw.ApplicationWindow):
 
     def launch(self, cmd):
         try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
         except OSError as e:
             self.set_state("error", f"Could not start the recorder: {e}")
             return False
         threading.Thread(target=self.read_output, args=(self.proc,), daemon=True).start()
+        self.usage = procstats.Usage(self.proc.pid)
+        self.switching = None
+        for bar, note in ((self.cpu_bar, self.cpu_note), (self.mem_bar, self.mem_note)):
+            bar.set_value(0)
+            note.set_text("measuring…")
+        self.sys_note.set_text("")
         return True
 
     def stop(self):
@@ -822,8 +894,10 @@ class Window(Adw.ApplicationWindow):
             elif word == "recording" and self.state in ("loading", "downloading", "recording"):
                 backlog = int(opts.get("backlog", 0))
                 if backlog > 3:
+                    lighter = (" A lighter model catches up faster: click the model tag to switch."
+                               if (self.run_model or "").startswith("whisper") else "")
                     self.set_state("recording", f"Transcription is {backlog} segments behind. It will catch up; "
-                                                "nothing is lost.")
+                                                f"nothing is lost.{lighter}")
                 elif self.state != "recording" or self.status_detail.get_text().startswith("Transcription is"):
                     self.set_state("recording")
             elif word == "finishing" and "speakers" in words:
@@ -836,6 +910,8 @@ class Window(Adw.ApplicationWindow):
                 self.status_detail.set_text("Please keep MeetScribe open until it's done.")
                 self.progress.set_fraction(done / total if total else 1)
                 self.progress.set_text(f"Transcribed {done} of {total} speech segments")
+        elif line.startswith("SWITCH: "):
+            self.on_switch(line[8:].split(" ", 2))
         elif line.startswith("NOTICE: "):
             self.toast(line[8:])
         elif line.startswith("ERROR: "):
@@ -859,6 +935,11 @@ class Window(Adw.ApplicationWindow):
         if proc is not self.proc:
             return False
         self.proc = None
+        self.switching = None
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
         again = self.retranscribing
         self.retranscribing = False
         self.banner.set_revealed(False)
@@ -874,7 +955,8 @@ class Window(Adw.ApplicationWindow):
             self.chat = chat.Chat(self.out_dir)
             self.render_chat()
             if again:
-                self.set_state("done", "Transcribed again. Your previous transcript is kept in the meeting folder.")
+                self.set_state("done", "Transcribed again. Your previous transcript is kept: open it from the "
+                                       "“Transcribed with” tag above the transcript.")
             elif self.t_text().strip():
                 self.set_state("done", f"Saved in {self.short(self.out_dir)}. Open “Ask Agent” to summarize "
                                        "it, list action items or ask questions.")
@@ -896,7 +978,36 @@ class Window(Adw.ApplicationWindow):
                 self.destroy()
         return False
 
+    def update_usage(self):
+        """Show how much CPU and memory the recorder (and the tools it started) is using right now."""
+        if self.usage is None or self.proc is None or self.usage.pid != self.proc.pid:
+            return
+        s = self.usage.sample()
+        if s is None:
+            return
+        cpus, size = s["cpus"], procstats.size
+        self.cpu_bar.set_value(min(1.0, s["cores"] / cpus))
+        self.cpu_note.set_text(f"{s['cores']:.1f} of {cpus} cores ({s['cores'] / cpus:.0%}) · "
+                               f"avg {s['avg_cores']:.1f}")
+        total = s["mem_total"] or 1
+        self.mem_bar.set_value(min(1.0, s["memory"] / total))
+        self.mem_note.set_text(f"{size(s['memory'])} ({s['memory'] / total:.0%} of {size(total)}) · "
+                               f"peak {size(s['peak'])}")
+        low_mem = s["mem_avail"] < total * 0.1
+        busy = s["system_cpu"] > 0.9
+        text = (f"Whole computer: CPU {s['system_cpu']:.0%} busy · {size(s['mem_avail'])} memory free · "
+                f"{s['processes']} MeetScribe process{'es' if s['processes'] != 1 else ''}")
+        if low_mem or busy:
+            text += ("\nYour computer is running low on memory." if low_mem else
+                     "\nYour computer is very busy, so transcription may fall behind (nothing is lost).")
+        self.sys_note.set_text(text)
+        for cls in ("dim-label", "warning"):
+            self.sys_note.remove_css_class(cls)
+        self.sys_note.add_css_class("warning" if low_mem or busy else "dim-label")
+
     def on_tick(self):
+        if self.proc is not None:
+            self.update_usage()
         if self.proc is not None and not self.retranscribing and self.state in ("downloading", "loading", "recording"):
             elapsed = int(time.monotonic() - self.record_start)
             self.timer_label.set_text(meetings.fmt_time(elapsed))
@@ -984,6 +1095,7 @@ class Window(Adw.ApplicationWindow):
             return
         self.flush_transcript_save()
         self.stop_playback()
+        self.leave_version()
         self.out_dir = None
         self.chat = None
         self.speaker_map = {}
@@ -1038,6 +1150,7 @@ class Window(Adw.ApplicationWindow):
 
     def show_transcript_file(self, folder):
         self.flush_transcript_save()
+        self.leave_version()
         path = chat.transcript_path(folder)
         self.loading_transcript = True
         self.t_buf.set_text("")
@@ -1061,6 +1174,255 @@ class Window(Adw.ApplicationWindow):
         if changed:     # speakers picked during the recording: write them into transcript.txt
             self.save_transcript()
 
+    # --- transcript versions: which model made it, and transcripts from earlier runs ----------------
+    @staticmethod
+    def when_text(dt):
+        return f"{dt:%-d %b, %H:%M}" if dt else "time unknown"
+
+    def leave_version(self):
+        self.viewing = None
+        self.version_bar.set_reveal_child(False)
+
+    def update_tag(self):
+        """The pill under the title: which speech model made (or is making) the transcript on screen."""
+        tag = self.model_tag
+        tag.remove_css_class("earlier")
+        if self.proc is not None and self.state in RECORDING_STATES:
+            name = meetings.model_name(self.run_model)
+            if self.retranscribing:
+                text = f"Transcribing again with {name}"
+            elif self.deferred and self.state != "finishing":
+                text = f"Recording · {name} transcribes after you stop"
+            else:
+                text = f"Transcribing with {name}"
+            live = not self.retranscribing and self.state == "recording" and not self.deferred
+            if live and self.switching:
+                mid, progress = self.switching
+                text += f" · switching to {meetings.model_name(mid)}{progress}"
+            tag.set_label(text)
+            tag.set_tooltip_text("Click to switch the speech model without stopping the recording" if live else
+                                 "The speech model making this transcript")
+            tag.set_sensitive(live)
+            tag.set_visible(True)
+            return
+        if self.out_dir is None or chat.transcript_path(self.out_dir) is None:
+            tag.set_visible(False)
+            return
+        if self.viewing is not None:
+            tag.set_label(f"Earlier transcript · {meetings.model_name(self.viewing['model'])}")
+            tag.add_css_class("earlier")
+        else:
+            n = len(meetings.list_versions(self.out_dir))
+            more = f" · {n} earlier version{'s' if n > 1 else ''}" if n else ""
+            tag.set_label(f"Transcribed with {meetings.model_name(meetings.current_model(self.out_dir)[0])}{more}")
+        tag.set_tooltip_text("Which speech model made this transcript. Click to open transcripts made with "
+                             "other models.")
+        tag.set_sensitive(True)
+        tag.set_visible(True)
+
+    def fill_version_popover(self, *_):
+        if self.proc is not None and not self.retranscribing:
+            self.fill_switch_popover()
+            return
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, width_request=320)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(6)
+        title = Gtk.Label(label="Transcripts of this meeting", xalign=0, margin_bottom=4)
+        title.add_css_class("heading")
+        box.append(title)
+        if self.out_dir is None:
+            self.version_popover.set_child(box)
+            return
+        model, when = meetings.current_model(self.out_dir)
+        versions = meetings.list_versions(self.out_dir)
+        entries = [(None, model, f"Current transcript · made {self.when_text(when)}")]
+        entries += [(v, v["model"], f"Made {self.when_text(v['transcribed'])} · replaced {self.when_text(v['replaced'])}")
+                    for v in versions]
+        for v, mid, sub in entries:
+            shown = (v is None and self.viewing is None) or \
+                    (v is not None and self.viewing is not None and v["id"] == self.viewing["id"])
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            label = meetings.model_name(mid)
+            name = Gtk.Label(label=label[:1].upper() + label[1:], xalign=0)
+            name.add_css_class("heading" if shown else "body")
+            info = Gtk.Label(label=sub, xalign=0)
+            info.add_css_class("dim-label")
+            info.add_css_class("caption")
+            texts.append(name)
+            texts.append(info)
+            row = Gtk.Box(spacing=8)
+            row.add_css_class("version-row")
+            row.append(texts)
+            texts.set_hexpand(True)
+            if shown:
+                row.append(Gtk.Image(icon_name="object-select-symbolic"))
+            b = Gtk.Button(child=row)
+            b.add_css_class("flat")
+            b.set_tooltip_text("Showing now" if shown else "Show this transcript" +
+                               ("" if v is None else " (read-only)"))
+            b.connect("clicked", lambda _b, ver=v: (self.version_popover.popdown(), self.show_version(ver)))
+            box.append(b)
+        if not versions:
+            note = Gtk.Label(label="No earlier transcripts yet. Use Transcribe again to make one with another model "
+                                   "and compare.", xalign=0, wrap=True, max_width_chars=40, margin_top=4)
+            note.add_css_class("dim-label")
+            note.add_css_class("caption")
+            box.append(note)
+        if self.retx_btn.get_visible():
+            box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
+            again = Gtk.Button(child=self.icon_label("view-refresh-symbolic", "Transcribe again with another model…"))
+            again.add_css_class("flat")
+            again.connect("clicked", lambda _b: (self.version_popover.popdown(), self.open_retranscribe_dialog()))
+            box.append(again)
+        self.version_popover.set_child(box)
+
+    def show_version(self, version):
+        """Show an earlier transcript read-only (None: back to the current one)."""
+        if self.out_dir is None or self.proc is not None:
+            return
+        if version is None:
+            if self.viewing is not None:
+                self.show_transcript_file(self.out_dir)
+        else:
+            try:
+                lines = version["path"].read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                self.toast(f"Couldn't open that transcript: {e}")
+                return
+            self.flush_transcript_save()
+            self.stop_playback()
+            self.viewing = version
+            self.segments = self.load_segments(version["path"].parent) if version["segments"] else []
+            self.loading_transcript = True
+            self.t_buf.set_text("")
+            self.loading_transcript = False
+            for line in lines:
+                if line.strip():
+                    self.append_transcript_line(line)
+            self.t_buf.set_enable_undo(False)
+            self.t_buf.set_enable_undo(True)
+            self.version_label.set_text(
+                f"You're viewing an earlier transcript made with {meetings.model_name(version['model'])} "
+                f"({self.when_text(version['transcribed'])}). It's read-only; Ask Agent and Export use the "
+                "current transcript.")
+            self.version_bar.set_reveal_child(True)
+            self.stack.set_visible_child_name("transcript")
+        self.render_bookmarks()
+        self.refresh_buttons()
+        self.update_tag()
+
+    # --- switching the speech model during a live recording ----------------------------------------
+    def fill_switch_popover(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, width_request=340)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(6)
+        title = Gtk.Label(label="Speech model for the rest of the meeting", xalign=0)
+        title.add_css_class("heading")
+        box.append(title)
+        note = Gtk.Label(label="Recording never stops. The current model keeps transcribing until the new one is "
+                               "ready, then it takes over. Earlier lines stay as they are.",
+                         xalign=0, wrap=True, max_width_chars=44, margin_bottom=4)
+        note.add_css_class("dim-label")
+        note.add_css_class("caption")
+        box.append(note)
+        lang = Gtk.DropDown(model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
+        lang.set_selected(self.lang_row.get_selected())
+        for i, (name, engine, model, info, _f) in enumerate(ENGINES):
+            mid = meetings.model_id(engine, model)
+            current = mid == self.run_model
+            pending = self.switching is not None and self.switching[0] == mid
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, hexpand=True)
+            head = Gtk.Label(label=meetings.model_name(mid) + (" (in use)" if current else
+                                                                " (loading…)" if pending else ""), xalign=0)
+            head.add_css_class("heading" if current else "body")
+            sub = Gtk.Label(label=info.split(". ")[0] + ".", xalign=0, wrap=True, max_width_chars=44)
+            sub.add_css_class("dim-label")
+            sub.add_css_class("caption")
+            texts.append(head)
+            texts.append(sub)
+            row = Gtk.Box(spacing=8)
+            row.add_css_class("version-row")
+            row.append(texts)
+            if current:
+                row.append(Gtk.Image(icon_name="object-select-symbolic"))
+            b = Gtk.Button(child=row, sensitive=not current and self.switching is None)
+            b.add_css_class("flat")
+            b.connect("clicked", lambda _b, k=i: (self.version_popover.popdown(),
+                                                  self.request_switch(k, LANGUAGES[lang.get_selected()][1])))
+            box.append(b)
+        lang_row = Gtk.Box(spacing=8, margin_top=6)
+        lang_label = Gtk.Label(label="Language (Whisper only)", xalign=0, hexpand=True)
+        lang_label.add_css_class("caption")
+        lang_row.append(lang_label)
+        lang_row.append(lang)
+        box.append(lang_row)
+        self.version_popover.set_child(box)
+
+    def request_switch(self, index, language):
+        """Ask the running recorder to change speech model; capture carries on uninterrupted."""
+        if self.proc is None or self.retranscribing or self.switching is not None:
+            return
+        _, engine, model = ENGINES[index][:3]
+        mid = meetings.model_id(engine, model)
+        if mid == self.run_model:
+            return
+        try:
+            self.proc.stdin.write(f"ENGINE {engine} {model or '-'} {language or '-'}\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            self.toast(f"Couldn't switch the model: {e}")
+            return
+        self.switching = (mid, "…")
+        self.switch_choice = (index, language)
+        self.update_tag()
+
+    def on_switch(self, words):
+        """SWITCH: loading|downloading|done|failed <model id> [details] from the recorder."""
+        if len(words) < 2:
+            return
+        kind, mid, rest = words[0], words[1], (words[2] if len(words) > 2 else "")
+        name = meetings.model_name(mid)
+        if kind == "loading":
+            self.switching = (mid, "…")
+        elif kind == "downloading":
+            pct = rest.partition("pct=")[2]
+            self.switching = (mid, f" (downloading{' ' + pct + '%' if pct else ''})")
+        elif kind == "done":
+            old = meetings.model_name(self.run_model)
+            self.run_model, self.switching = mid, None
+            choice = getattr(self, "switch_choice", None)
+            if choice and meetings.model_id(*ENGINES[choice[0]][1:3]) == mid:
+                self.set_engine(choice[0])      # the settings show what is in use, and the next meeting starts with it
+                langs = [c for _, c in LANGUAGES]
+                if choice[1] in langs:
+                    self.lang_row.set_selected(langs.index(choice[1]))
+                save_settings(self.current_settings())
+            at = rest.partition("at=")[2]
+            when = f" from {meetings.fmt_time(float(at))}" if at else ""
+            self.toast(f"Now transcribing with {name}{when}. Earlier lines keep their {old} text.")
+        elif kind == "failed":
+            self.switching = None
+            self.toast(f"Couldn't switch to {name}: {rest or 'unknown error'}. Still using "
+                       f"{meetings.model_name(self.run_model)}.")
+        self.update_tag()
+
+    def restore_viewed_version(self):
+        v = self.viewing
+        if v is None or self.out_dir is None or self.proc is not None:
+            return
+        old = meetings.model_name(meetings.current_model(self.out_dir)[0])
+        try:
+            meetings.restore_version(self.out_dir, v["id"])
+        except OSError as e:
+            self.toast(f"Couldn't switch transcripts: {e}")
+            return
+        self.show_transcript_file(self.out_dir)
+        self.render_bookmarks()
+        self.refresh_buttons()
+        self.update_tag()
+        self.toast(f"Now using the {meetings.model_name(v['model'])} transcript. The {old} one is kept as an "
+                   "earlier version.")
+
     def on_transcript_edited(self, _buf):
         if self.loading_transcript or not self.t_view.get_editable():
             return
@@ -1077,7 +1439,7 @@ class Window(Adw.ApplicationWindow):
 
     def save_transcript(self):
         self.save_timer = 0
-        if self.out_dir is None:
+        if self.out_dir is None or self.viewing is not None:
             return False
         lines = []
         for line in self.t_text().splitlines():
@@ -1464,6 +1826,9 @@ class Window(Adw.ApplicationWindow):
         who_start = len(m.group(1)) + 2
         if not who_start <= col <= who_start + len(m.group(2)):
             return      # clicked the text, not the speaker name
+        if self.viewing is not None:
+            self.toast("This earlier transcript is read-only. Press “Use this version” to change its speakers.")
+            return
         rect = Gdk.Rectangle()
         rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
         self.show_speaker_popover(line, m.group(2), rect)
@@ -1711,9 +2076,11 @@ class Window(Adw.ApplicationWindow):
         dialog.set_child(view)
         group = Adw.PreferencesGroup(
             title="Engine",
-            description="Makes a fresh transcript from this meeting's saved audio. Your current transcript is kept "
-                        "as a backup file in the meeting folder. Speakers are detected again, and voices you have "
-                        "named before are recognised automatically.")
+            description=f"The current transcript was made with "
+                        f"{meetings.model_name(meetings.current_model(self.out_dir)[0])}. This makes a fresh one from "
+                        "the meeting's saved audio. The current transcript is kept, and you can open it again from "
+                        "the “Transcribed with” tag. Speakers are detected again, and voices you have named before "
+                        "are recognised automatically.")
         checks = []
         for name, _engine, _model, _info, factor in ENGINES:
             check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
@@ -1750,6 +2117,8 @@ class Window(Adw.ApplicationWindow):
         self.flush_transcript_save()
         self.stop_playback()
         _, engine, model = ENGINES[engine_index][:3]
+        self.run_model = meetings.model_id(engine, model)
+        self.leave_version()
         cmd += ["--retranscribe", str(self.out_dir), "--engine", engine]
         if engine == "whisper":
             cmd += ["--model", model, "--language", language]

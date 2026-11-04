@@ -4,8 +4,13 @@
 Engines:
   parakeet  NVIDIA Parakeet TDT 0.6B v3 via sherpa-onnx. Fast on CPU (about 7x real time on 2 threads),
             English + 24 European languages, automatic language detection. Transcribes live.
-  whisper   faster-whisper (OpenAI Whisper). ~100 languages but about real-time speed on a laptop CPU,
-            so by default it only records during the call and transcribes after you stop.
+  whisper   faster-whisper (OpenAI Whisper). ~100 languages. On an 8-core laptop small runs ~5x and medium ~2x
+            faster than speech on 4 threads, so it can transcribe live (--live, which the app always uses);
+            without --live it only records during the call and transcribes after you stop.
+
+With --control the recorder reads commands on stdin while recording. "ENGINE <parakeet|whisper> <model|-> <lang|->"
+switches the speech model mid-meeting: the new one loads in the background while the current one keeps
+transcribing, then takes over from the next speech chunk. Progress is reported as "SWITCH: ..." lines.
 
 Speakers: each chunk of meeting audio gets a voiceprint (ERes2Net via sherpa-onnx). During the call chunks
 are grouped online into "Speaker 1", "Speaker 2", ...; after the call all voiceprints are re-clustered and
@@ -14,6 +19,7 @@ compared with the voice profiles learned from earlier meetings (see voices.py) s
 import argparse
 import datetime
 import difflib
+import gc
 import json
 import os
 import pathlib
@@ -30,6 +36,7 @@ import urllib.request
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import meetings  # noqa: E402
 import voices  # noqa: E402
 
 RATE = 16000
@@ -228,6 +235,62 @@ class Whisper:
         return " ".join(p for p in parts if p).strip()
 
 
+def live_threads(engine):
+    """Threads while recording: Parakeet needs few; Whisper gets 4 (more barely helps and competes with the call)."""
+    return 2 if engine == "parakeet" else min(4, max(2, (os.cpu_count() or 4) // 2))
+
+
+def make_engine(engine, model, language, threads, report):
+    if engine == "parakeet":
+        download_parakeet(report)
+        return Parakeet(threads)
+    return Whisper(whisper_path(model, report), threads, language)
+
+
+class Switcher:
+    """Loads another speech engine in the background; the main loop picks it up between chunks."""
+
+    def __init__(self, threads=None):
+        self.lock = threading.Lock()
+        self.threads = threads
+        self.ready = None       # (engine, model id) waiting to take over
+        self.generation = 0     # a newer request makes older ones void
+
+    def request(self, engine, model, language):
+        with self.lock:
+            self.generation += 1
+            gen = self.generation
+        threading.Thread(target=self._load, args=(gen, engine, model, language), daemon=True).start()
+
+    def _load(self, gen, engine, model, language):
+        mid = meetings.model_id(engine, model)
+        say(f"SWITCH: loading {mid}")
+        try:
+            new = make_engine(engine, model, language, self.threads or live_threads(engine),
+                              lambda pct: say(f"SWITCH: downloading {mid}" + (f" pct={pct}" if pct is not None else "")))
+        except Exception as e:  # noqa: BLE001 - keep the current engine and tell the UI
+            say(f"SWITCH: failed {mid} {e}")
+            return
+        with self.lock:
+            if gen == self.generation:
+                self.ready = (new, mid)
+
+    def take(self):
+        with self.lock:
+            ready, self.ready = self.ready, None
+        return ready
+
+
+def read_commands(switcher):
+    """--control: commands from the app on stdin, one per line."""
+    for line in sys.stdin:
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "ENGINE" and parts[1] in ("parakeet", "whisper"):
+            model = parts[2] if len(parts) > 2 and parts[2] != "-" else "small"
+            language = parts[3] if len(parts) > 3 and parts[3] not in ("-", "auto") else None
+            switcher.request(parts[1], model, language)
+
+
 def whisper_path(name, report):
     from faster_whisper.utils import download_model
     try:
@@ -389,6 +452,8 @@ def main():
     ap.add_argument("--system-source", help="fixed system-audio source (default: follow the default output's monitor)")
     ap.add_argument("--mic-source", help="fixed microphone source (default: follow the default input)")
     ap.add_argument("--no-speakers", action="store_true", help="don't tell speakers apart")
+    ap.add_argument("--control", action="store_true",
+                    help="accept commands on stdin while recording, e.g. ENGINE whisper medium en")
     ap.add_argument("--retranscribe", metavar="FOLDER", help="transcribe a finished meeting again from its saved audio")
     ap.add_argument("--prepare", action="store_true", help="download the Parakeet and speaker models and exit")
     args = ap.parse_args()
@@ -407,7 +472,7 @@ def main():
     language = None if args.language in (None, "", "auto") else args.language
     defer = args.engine == "whisper" and not args.live and not offline
     half = max(2, (os.cpu_count() or 4) // 2)
-    threads = args.threads or (half if (defer or offline) else 2)
+    threads = args.threads or (half if (defer or offline) else live_threads(args.engine))
 
     if args.retranscribe:
         out = pathlib.Path(args.retranscribe)
@@ -503,6 +568,11 @@ def main():
         sys.exit(1)
     say("STATE: recording backlog=0" if not (stopping.is_set() or offline)
         else f"STATE: finishing done=0 total={stats.total}")
+    model_now = meetings.model_id(args.engine, args.model)
+    switcher = None
+    if args.control and not offline:
+        switcher = Switcher(args.threads)
+        threading.Thread(target=read_commands, args=(switcher,), daemon=True).start()
 
     segs = []
     with open(out / "transcript.live.txt", "w" if args.retranscribe else "a", encoding="utf-8") as live:
@@ -513,6 +583,11 @@ def main():
                 if not any(s.is_alive() for s in streams) and q.empty():
                     break
                 continue
+            ready = switcher.take() if switcher else None
+            if ready:       # a newly loaded model takes over from this chunk on; the old one is freed
+                engine, model_now = ready
+                gc.collect()
+                say(f"SWITCH: done {model_now} at={ts:.1f}")
             audio = pcm.astype(np.float32) / 32768
             text = engine(audio)
             with stats.lock:
@@ -522,7 +597,7 @@ def main():
                 emb = speakers.embed(audio) if speakers and stream != "You" else None
                 label = "You" if stream == "You" else (speakers.live_label(emb, secs) if speakers else stream)
                 segs.append({"start": ts, "end": ts + secs, "stream": stream, "label": label, "text": text,
-                             "emb": emb})
+                             "emb": emb, "model": model_now})
                 line = f"[{fmt(ts)}] {label}: {text}"
                 live.write(line + "\n")
                 live.flush()
@@ -539,15 +614,19 @@ def main():
         for g, label in zip(others, speakers.final_labels(others)):
             g["label"] = label
     final = out / "transcript.txt"
-    if args.retranscribe and final.exists():
-        backup = out / f"transcript.before-{args.engine}-{datetime.datetime.now():%Y%m%d-%H%M%S}.txt"
-        final.rename(backup)
-        say(f"NOTICE: Your previous transcript is kept as {backup.name}")
+    if final.exists():      # transcribing again: keep the previous transcript as an earlier version
+        old = meetings.model_name(meetings.current_model(out)[0])
+        meetings.archive_current(out)
+        say(f"NOTICE: Your previous transcript ({old}) is kept. Open it from the “Transcribed with” tag.")
     final.write_text("".join(f"[{fmt(g['start'])}] {g['label']}: {g['text']}\n" for g in segs), encoding="utf-8")
     (out / "segments.json").write_text(json.dumps([
         {"start": round(g["start"], 1), "end": round(g["end"], 1), "stream": g["stream"], "label": g["label"],
-         "text": g["text"], "emb": None if g["emb"] is None else [round(float(x), 4) for x in g["emb"]]}
+         "text": g["text"], "emb": None if g["emb"] is None else [round(float(x), 4) for x in g["emb"]],
+         "model": g["model"]}
         for g in segs]), encoding="utf-8")
+    used = list(dict.fromkeys(g["model"] for g in sorted(segs, key=lambda g: g["start"]))) or [model_now]
+    meetings.save_meta(out, model="+".join(used),     # "parakeet+whisper-medium" if you switched mid-meeting
+                       transcribed=datetime.datetime.now().isoformat(timespec="seconds"))
     say(f"DONE: {final}")
 
 
