@@ -1,0 +1,2006 @@
+#!/usr/bin/env python3
+"""MeetScribe: record meetings, transcribe them locally, tell speakers apart and chat with an agent about them."""
+import datetime
+import json
+import math
+import os
+import pathlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+
+import callwatch  # noqa: E402
+import chat  # noqa: E402
+import meetings  # noqa: E402
+import speakers  # noqa: E402
+import tray  # noqa: E402
+import voices  # noqa: E402
+
+APP_ID = "dev.meetscribe.app"
+APP_DIR = pathlib.Path(__file__).resolve().parent
+CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
+MEETINGS_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_MEETINGS_DIR", pathlib.Path.home() / "MeetScribe"))
+AUTOSTART = pathlib.Path.home() / ".config/autostart" / f"{APP_ID}.desktop"
+
+# (menu label, engine, whisper model, explanation, rough processing time as a fraction of meeting length)
+ENGINES = [
+    ("Parakeet (recommended)", "parakeet", None,
+     "Fast and light: transcribes live while using a small share of two CPU cores. "
+     "English and 24 European languages, detected automatically.", 0.2),
+    ("Whisper small", "whisper", "small",
+     "Urdu, Arabic, Hindi, Chinese and ~90 more. Too heavy to run during a call on this laptop, so it only "
+     "records during the call and transcribes after you stop (takes roughly as long as the meeting).", 1.0),
+    ("Whisper medium", "whisper", "medium",
+     "Other languages, more accurate than Whisper small but 2–3× slower after the call. "
+     "Downloads 1.5 GB the first time.", 2.5),
+]
+LANGUAGES = [
+    ("Detect automatically", ""), ("English", "en"), ("Urdu", "ur"), ("Arabic", "ar"), ("Hindi", "hi"),
+    ("Chinese", "zh"), ("Spanish", "es"), ("French", "fr"), ("German", "de"), ("Portuguese", "pt"),
+    ("Russian", "ru"), ("Turkish", "tr"), ("Japanese", "ja"), ("Korean", "ko"),
+]
+SUGGESTIONS = [
+    "Summarize the meeting",
+    "List the action items with owners and deadlines",
+    "What decisions were made?",
+    "Write a follow-up email to the participants",
+    "What questions are still open?",
+]
+EXPORT_FORMATS = [
+    ("Word document", ".docx", "Opens in Word, LibreOffice or Google Docs."),
+    ("PDF", ".pdf", "Good for sharing and printing."),
+    ("Markdown", ".md", "Plain text with formatting, for notes apps such as Obsidian or Notion."),
+]
+LINE_RE = re.compile(r"^\[(\d\d:\d\d:\d\d)\] ([^:\[\]]+?): (.*)$")       # transcript.txt
+SCREEN_RE = re.compile(r"^(\d\d:\d\d:\d\d) {2}(.+?) {2}(.*)$")               # how lines look on screen
+BASE_LABEL_RE = re.compile(r"^(Them|You|Audio|Speaker \d+)$")               # labels the recorder writes
+SPEAKER_N_RE = re.compile(r"^Speaker \d+$")
+SAVE_DELAY_MS = 800
+SPEAKER_COLOURS = ["#3584e4", "#c061cb", "#e66100", "#2190a4", "#986a44", "#1c71d8", "#a51d2d", "#813d9c"]
+NO_AUDIO_AFTER = 15     # seconds of recording before warning about silence
+DEFAULT_PREFS = {"background": True, "detect_calls": True, "autostart": False, "speakers": True}
+RECORDING_STATES = ("downloading", "loading", "recording", "finishing")
+
+CSS = """
+.timer { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.status-card { padding: 16px 18px; }
+.status-title { font-size: 17px; font-weight: 700; }
+.meter-label { font-size: 12px; }
+.user-bubble { background: var(--accent-bg-color); color: var(--accent-fg-color); border-radius: 16px;
+               padding: 8px 14px; }
+.assistant-bubble { background: var(--card-bg-color); border-radius: 16px; padding: 10px 14px;
+                    box-shadow: 0 1px 2px rgba(0,0,0,0.12); }
+.bubble-author { font-size: 11px; font-weight: 700; }
+.meeting-title { font-size: 20px; font-weight: 800; }
+"""
+
+
+def level_fraction(rms):
+    """Map an RMS level (0..1) to a 0..1 meter position on a log scale."""
+    return max(0.0, min(1.0, (math.log10(max(rms, 1e-5)) + 4.0) / 3.5))
+
+
+def md_to_markup(md):
+    """Small Markdown -> Pango markup converter for chat replies."""
+    out, in_code = [], False
+    for raw in md.splitlines():
+        if raw.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        line = GLib.markup_escape_text(raw)
+        if in_code:
+            out.append(f"<tt>{line}</tt>")
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            text = m.group(2).replace("**", "")
+            out.append(f"<b><big>{text}</big></b>" if len(m.group(1)) <= 2 else f"<b>{text}</b>")
+            continue
+        line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line)
+        line = re.sub(r"(?<![*\w])\*(?![\s*])([^*]+?)(?<!\s)\*(?![*\w])", r"<i>\1</i>", line)
+        line = re.sub(r"`([^`]+)`", r"<tt>\1</tt>", line)
+        line = re.sub(r"^(\s*)[-*]\s+", r"\1  •  ", line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def set_markdown(label, md):
+    markup = md_to_markup(md)
+    try:
+        Pango.parse_markup(markup, -1, "\0")
+        label.set_markup(markup)
+    except GLib.Error:
+        label.set_text(md)
+
+
+def secs(stamp):
+    h, m, s = (int(x) for x in stamp.split(":"))
+    return h * 3600 + m * 60 + s
+
+
+def load_settings():
+    try:
+        return json.loads((CONFIG_DIR / "settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    """Merge `data` into settings.json (recording settings and preferences share the file)."""
+    try:
+        merged = load_settings()
+        merged.update(data)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        (CONFIG_DIR / "settings.json").write_text(json.dumps(merged))
+    except OSError:
+        pass
+
+
+def prefs():
+    return {**DEFAULT_PREFS, **load_settings().get("prefs", {})}
+
+
+def set_autostart(enabled):
+    if enabled:
+        AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+        AUTOSTART.write_text("[Desktop Entry]\nType=Application\nName=MeetScribe\n"
+                             f"Exec={APP_DIR / 'meetscribe'} --background\nIcon=audio-input-microphone\n"
+                             "X-GNOME-Autostart-enabled=true\nNoDisplay=false\n")
+    elif AUTOSTART.exists():
+        AUTOSTART.unlink()
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, hooks=None):
+        super().__init__(application=app, title="MeetScribe", default_width=1360, default_height=840)
+        self.hooks = hooks          # the App when running for real (tray, notifications); None in tests
+        self.proc = None
+        self.out_dir = None
+        self.chat = None
+        self.state = "idle"     # idle, downloading, loading, recording, finishing, done, cancelled, error
+        self.deferred = False
+        self.retranscribing = False
+        self.record_start = 0.0
+        self.peaks = {"them": 0.0, "you": 0.0}
+        self.heard = {"them": False, "you": False}
+        self.quit_after_stop = False
+        self.quit_dialog = None
+        self.last_error = None
+        self.reply_label = None
+        self.reply_text = ""
+        self.loading_transcript = False
+        self.save_timer = 0
+        self.speaker_map = {}       # "HH:MM:SS|text start" -> assigned name, for the current meeting
+        self.live_names = {}        # "Speaker 2" -> "Awan" while recording, so new lines follow your choice
+        self.speaker_popover = None
+        self.segments = []
+        self.bookmarks = []
+        self.bm_rows = []
+        self.player = None
+        self.export_dialog = None
+        self.retx_dialog = None
+
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+        self.split = Adw.OverlaySplitView(min_sidebar_width=250, max_sidebar_width=320, sidebar_width_fraction=0.2)
+        self.toasts.set_child(self.split)
+        self.split.set_sidebar(self.build_sidebar())
+        view = Adw.ToolbarView()
+        self.split.set_content(view)
+        view.add_top_bar(self.build_header())
+        self.banner = Adw.Banner(title="", revealed=False)
+        view.add_top_bar(self.banner)
+
+        # Two columns: controls on the left, transcript / chat on the right.
+        columns = Gtk.Box(spacing=18)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(columns, f"set_margin_{side}")(16)
+        view.set_content(columns)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_end=4)
+        left.append(self.build_status_card())
+        self.settings_group = self.build_settings()
+        left.append(self.settings_group)
+        left.append(self.build_start_button())
+        left.append(self.build_extra_buttons())
+        left.append(self.build_bookmarks())
+        left_scroll = Gtk.ScrolledWindow(child=left, hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                         propagate_natural_height=True)
+        left_scroll.set_size_request(380, -1)
+        columns.append(left_scroll)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True)
+        right.append(self.build_title())
+        right.append(self.build_results())
+        columns.append(right)
+
+        medium = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 1200sp"))
+        medium.add_setter(self.split, "collapsed", True)
+        self.add_breakpoint(medium)
+        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 900sp"))
+        narrow.add_setter(self.split, "collapsed", True)
+        narrow.add_setter(columns, "orientation", Gtk.Orientation.VERTICAL)
+        self.add_breakpoint(narrow)
+
+        self.apply_saved_settings()
+        self.connect("close-request", self.on_close_request)
+        GLib.timeout_add_seconds(1, self.on_tick)
+        self.set_state("idle")
+        self.refresh_sidebar()
+
+    # --- building the UI -------------------------------------------
+    @staticmethod
+    def icon_label(icon, text):
+        return Adw.ButtonContent(icon_name=icon, label=text)
+
+    def build_header(self):
+        header = Adw.HeaderBar()
+        self.sidebar_btn = Gtk.ToggleButton(icon_name="sidebar-show-symbolic")
+        self.sidebar_btn.set_tooltip_text("Show or hide the list of meetings")
+        self.sidebar_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Meetings list"])
+        self.split.bind_property("show-sidebar", self.sidebar_btn, "active",
+                                 GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
+        header.pack_start(self.sidebar_btn)
+        self.speakers_btn = Gtk.Button(child=self.icon_label("system-users-symbolic", "Speakers…"))
+        self.speakers_btn.set_tooltip_text("Add the people from your meetings (name and optional email), "
+                                           "then click a speaker name on a transcript line to say who spoke")
+        self.speakers_btn.connect("clicked", lambda _b: self.open_speakers_dialog())
+        header.pack_start(self.speakers_btn)
+
+        menu = Gio.Menu()
+        menu.append("Preferences", "app.preferences")
+        menu.append("Quit MeetScribe", "app.quit")
+        self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
+        self.menu_btn.set_tooltip_text("Preferences and quit")
+        header.pack_end(self.menu_btn)
+        self.folder_btn = Gtk.Button(icon_name="folder-symbolic")
+        self.folder_btn.set_tooltip_text("Open this meeting's folder (transcript, audio recordings, chat)")
+        self.folder_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Open meeting folder"])
+        self.folder_btn.connect("clicked", self.on_open_folder)
+        header.pack_end(self.folder_btn)
+        self.export_btn = Gtk.Button(child=self.icon_label("document-save-as-symbolic", "Export…"))
+        self.export_btn.set_tooltip_text("Save this meeting as a Word document, PDF or Markdown file")
+        self.export_btn.connect("clicked", lambda _b: self.open_export_dialog())
+        header.pack_end(self.export_btn)
+        return header
+
+    def build_sidebar(self):
+        view = Adw.ToolbarView()
+        head = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+        head.set_title_widget(Adw.WindowTitle(title="Meetings"))
+        view.add_top_bar(head)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(8)
+        self.new_btn = Gtk.Button(child=self.icon_label("list-add-symbolic", "New meeting"))
+        self.new_btn.set_tooltip_text("Clear the window, ready to record a new meeting")
+        self.new_btn.connect("clicked", lambda _b: self.new_meeting())
+        box.append(self.new_btn)
+        self.meeting_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.meeting_list.add_css_class("navigation-sidebar")
+        self.meeting_list.connect("row-activated", self.on_meeting_row)
+        box.append(Gtk.ScrolledWindow(child=self.meeting_list, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        self.meeting_empty = Gtk.Label(label="Your recorded meetings will appear here.", wrap=True, vexpand=True,
+                                       valign=Gtk.Align.START)
+        self.meeting_empty.add_css_class("dim-label")
+        box.append(self.meeting_empty)
+        view.set_content(box)
+        return view
+
+    def build_title(self):
+        row = Gtk.Box(spacing=8)
+        self.title_label = Gtk.EditableLabel(text="New meeting", hexpand=True)
+        self.title_label.add_css_class("meeting-title")
+        self.title_label.set_tooltip_text("Click to rename this meeting")
+        self.title_label.connect("notify::editing", self.on_title_editing)
+        row.append(self.title_label)
+        self.title_hint = Gtk.Image(icon_name="document-edit-symbolic")
+        self.title_hint.add_css_class("dim-label")
+        self.title_hint.set_tooltip_text("Click the title to rename this meeting")
+        row.append(self.title_hint)
+        return row
+
+    def build_status_card(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.add_css_class("card")
+        card.add_css_class("status-card")
+        row = Gtk.Box(spacing=14)
+        self.status_icon = Gtk.Image(icon_name="audio-input-microphone-symbolic", pixel_size=32)
+        self.spinner = Adw.Spinner(visible=False)
+        self.spinner.set_size_request(32, 32)
+        row.append(self.status_icon)
+        row.append(self.spinner)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True, valign=Gtk.Align.CENTER)
+        self.status_title = Gtk.Label(xalign=0, wrap=True)
+        self.status_title.add_css_class("status-title")
+        self.status_detail = Gtk.Label(xalign=0, wrap=True)
+        self.status_detail.add_css_class("dim-label")
+        text.append(self.status_title)
+        text.append(self.status_detail)
+        row.append(text)
+        self.timer_label = Gtk.Label(label="00:00:00", visible=False, valign=Gtk.Align.CENTER)
+        self.timer_label.add_css_class("timer")
+        self.timer_label.set_tooltip_text("Recording time")
+        row.append(self.timer_label)
+        card.append(row)
+
+        self.progress = Gtk.ProgressBar(visible=False, show_text=True)
+        card.append(self.progress)
+        self.meters = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, visible=False)
+        self.them_bar, self.them_note = self.add_meter("Meeting audio (other people)")
+        self.you_bar, self.you_note = self.add_meter("Your microphone")
+        card.append(self.meters)
+        return card
+
+    def add_meter(self, title):
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        top = Gtk.Box(spacing=10)
+        label = Gtk.Label(label=title, xalign=0, hexpand=True)
+        label.add_css_class("meter-label")
+        note = Gtk.Label(label="", xalign=1)
+        note.add_css_class("meter-label")
+        note.add_css_class("dim-label")
+        top.append(label)
+        top.append(note)
+        bar = Gtk.LevelBar(min_value=0, max_value=1, hexpand=True)
+        row.append(top)
+        row.append(bar)
+        self.meters.append(row)
+        return bar, note
+
+    def build_settings(self):
+        group = Adw.PreferencesGroup()
+        self.settings_expander = Adw.ExpanderRow(title="Recording settings", icon_name="emblem-system-symbolic")
+        group.add(self.settings_expander)
+        # Engines are radio rows rather than a dropdown so names and explanations are never cut off.
+        engine_rows, self.engine_checks = [], []
+        for name, _, _, info, _ in ENGINES:
+            check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            if self.engine_checks:
+                check.set_group(self.engine_checks[0])
+            check.connect("toggled", self.on_engine_changed)
+            row = Adw.ActionRow(title=name, subtitle=info, activatable_widget=check)
+            row.add_prefix(check)
+            engine_rows.append(row)
+            self.engine_checks.append(check)
+        self.engine_checks[0].set_active(True)
+        self.lang_row = Adw.ComboRow(title="Meeting language (Whisper only)",
+                                     model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
+        self.lang_row.set_tooltip_text("Choosing the language is more reliable than automatic detection.")
+        self.lang_row.set_factory(self.plain_factory())
+        self.lang_row.set_list_factory(self.plain_factory())
+        self.system_row = Adw.SwitchRow(title="Record meeting audio", active=True,
+                                        subtitle="What other people say, captured from your computer's audio output.")
+        self.mic_row = Adw.SwitchRow(title="Record my microphone", active=True,
+                                     subtitle="What you say. Wear headphones so the meeting audio doesn't echo into your mic.")
+        for row in (*engine_rows, self.lang_row, self.system_row, self.mic_row):
+            self.settings_expander.add_row(row)
+        for row in (self.lang_row, self.system_row, self.mic_row):
+            row.connect("notify::selected" if isinstance(row, Adw.ComboRow) else "notify::active",
+                        lambda *_: self.update_settings_summary())
+        self.on_engine_changed()
+        return group
+
+    @staticmethod
+    def plain_factory():
+        """List item factory whose labels never ellipsize."""
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _f, item: item.set_child(Gtk.Label(xalign=0)))
+        factory.connect("bind", lambda _f, item: item.get_child().set_label(item.get_item().get_string()))
+        return factory
+
+    def get_engine(self):
+        return next(i for i, c in enumerate(self.engine_checks) if c.get_active())
+
+    def set_engine(self, index):
+        self.engine_checks[index].set_active(True)
+
+    def update_settings_summary(self):
+        """One-line summary shown on the collapsed settings row."""
+        cfg = self.current_settings()
+        name, engine = ENGINES[cfg["engine"]][:2]
+        parts = [name.replace(" (recommended)", "")]
+        if engine == "whisper":
+            parts.append(LANGUAGES[self.lang_row.get_selected()][0])
+        sources = [w for w, on in (("meeting audio", cfg["system"]), ("your mic", cfg["mic"])) if on]
+        parts.append(" + ".join(sources) if sources else "nothing selected to record")
+        self.settings_expander.set_subtitle(" · ".join(parts))
+
+    def build_start_button(self):
+        self.start_btn = Gtk.Button(halign=Gtk.Align.CENTER)
+        self.start_btn.add_css_class("pill")
+        self.start_btn.set_size_request(260, 52)
+        self.start_btn.connect("clicked", self.on_start_stop)
+        return self.start_btn
+
+    def build_extra_buttons(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, halign=Gtk.Align.CENTER)
+        self.bookmark_btn = Gtk.Button(child=self.icon_label("starred-symbolic", "Bookmark this moment"))
+        self.bookmark_btn.add_css_class("pill")
+        self.bookmark_btn.set_tooltip_text("Mark this moment as important (Ctrl+B). The agent pays extra attention "
+                                           "to bookmarked moments, and you can jump back to them.")
+        self.bookmark_btn.connect("clicked", lambda _b: self.add_bookmark())
+        self.retx_btn = Gtk.Button(child=self.icon_label("view-refresh-symbolic", "Transcribe again…"))
+        self.retx_btn.set_tooltip_text("Run a fresh transcription of this meeting's saved audio, for example "
+                                       "with the more accurate Whisper medium")
+        self.retx_btn.connect("clicked", lambda _b: self.open_retranscribe_dialog())
+        box.append(self.bookmark_btn)
+        box.append(self.retx_btn)
+        return box
+
+    def build_bookmarks(self):
+        self.bm_group = Adw.PreferencesGroup(title="Bookmarks",
+                                             description="Click one to jump to that moment in the transcript.")
+        return self.bm_group
+
+    def build_results(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, vexpand=True)
+        self.stack = Adw.ViewStack(vexpand=True)
+        box.append(Adw.InlineViewSwitcher(stack=self.stack, halign=Gtk.Align.CENTER))
+        box.append(self.stack)
+        self.stack.add_titled_with_icon(self.build_transcript_page(), "transcript", "Transcript",
+                                        "text-x-generic-symbolic")
+        self.stack.add_titled_with_icon(self.build_chat_page(), "chat", "Ask Agent", "user-available-symbolic")
+        return box
+
+    def build_transcript_page(self):
+        t_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.t_stack = Gtk.Stack(vexpand=True)
+        self.t_empty = Adw.StatusPage(icon_name="audio-input-microphone-symbolic", title="No transcript yet",
+                                      description="Press Start recording before your meeting begins. "
+                                                  "The conversation will appear here as people speak.")
+        self.t_empty.add_css_class("compact")
+        self.t_stack.add_named(self.t_empty, "empty")
+        self.t_buf = Gtk.TextBuffer()
+        self.t_buf.create_tag("time", foreground="#8a8a8a", underline=Pango.Underline.SINGLE)
+        self.t_buf.create_tag("them", foreground="#3584e4", weight=Pango.Weight.BOLD)
+        for i, colour in enumerate(SPEAKER_COLOURS):
+            self.t_buf.create_tag(f"spk{i}", foreground=colour, weight=Pango.Weight.BOLD)
+        self.t_buf.create_tag("you", foreground="#26a269", weight=Pango.Weight.BOLD)
+        self.t_buf.create_tag("speaker-link", underline=Pango.Underline.SINGLE)
+        self.t_buf.create_tag("flash", background="#f6d32d")
+        self.t_view = Gtk.TextView(buffer=self.t_buf, editable=False, cursor_visible=False,
+                                   wrap_mode=Gtk.WrapMode.WORD_CHAR, pixels_below_lines=4)
+        for side in ("top", "bottom", "left", "right"):
+            getattr(self.t_view, f"set_{side}_margin")(10)
+        self.t_buf.connect("changed", self.on_transcript_edited)
+        click = Gtk.GestureClick()
+        click.connect("released", self.on_transcript_clicked)
+        self.t_view.add_controller(click)
+        self.t_stack.add_named(Gtk.ScrolledWindow(child=self.t_view, vexpand=True), "text")
+
+        hint_row = Gtk.Box(spacing=8)
+        self.edit_hint = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+        self.edit_hint.add_css_class("dim-label")
+        self.edit_hint.add_css_class("meter-label")
+        self.save_status = Gtk.Label(xalign=1)
+        self.save_status.add_css_class("meter-label")
+        hint_row.append(self.edit_hint)
+        hint_row.append(self.save_status)
+        self.play_box = Gtk.Box(spacing=8, visible=False)
+        self.play_label = Gtk.Label(xalign=0, wrap=True, hexpand=True)
+        self.play_label.add_css_class("meter-label")
+        stop_play = Gtk.Button(child=self.icon_label("media-playback-stop-symbolic", "Stop"))
+        stop_play.add_css_class("flat")
+        stop_play.set_tooltip_text("Stop playback")
+        stop_play.connect("clicked", lambda _b: self.stop_playback())
+        self.play_box.append(Gtk.Image(icon_name="audio-speakers-symbolic"))
+        self.play_box.append(self.play_label)
+        self.play_box.append(stop_play)
+        t_page.append(hint_row)
+        t_page.append(self.play_box)
+        t_page.append(self.t_stack)
+        actions = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        self.copy_t_btn = Gtk.Button(child=self.icon_label("edit-copy-symbolic", "Copy transcript"))
+        self.copy_t_btn.set_tooltip_text("Copy the whole transcript to the clipboard")
+        self.copy_t_btn.connect("clicked", lambda _b: self.copy(self.t_text(), "Transcript copied"))
+        self.ask_btn = Gtk.Button(child=self.icon_label("user-available-symbolic", "Ask Agent about it"))
+        self.ask_btn.add_css_class("suggested-action")
+        self.ask_btn.set_tooltip_text("Open the chat to summarize, find action items, draft emails and more")
+        self.ask_btn.connect("clicked", lambda _b: self.stack.set_visible_child_name("chat"))
+        actions.append(self.copy_t_btn)
+        actions.append(self.ask_btn)
+        t_page.append(actions)
+        return t_page
+
+    def build_chat_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.c_stack = Gtk.Stack(vexpand=True)
+        locked = Adw.StatusPage(icon_name="user-available-symbolic", title="Chat with Claude about your meeting",
+                                description="Available once a recording has finished, or after you open a previous "
+                                            "meeting. Claude reads the transcript and answers like a normal chat.")
+        locked.add_css_class("compact")
+        self.c_stack.add_named(locked, "locked")
+
+        empty = Adw.StatusPage(icon_name="user-available-symbolic", title="Ask the agent anything about this meeting",
+                               description="Claude has the full transcript. Pick a suggestion or type your own "
+                                           "question below. Uses your Claude subscription; only the transcript "
+                                           "text is sent, never the audio.")
+        empty.add_css_class("compact")
+        flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=2, column_spacing=8,
+                           row_spacing=8, halign=Gtk.Align.CENTER)
+        self.suggestion_btns = []
+        for text in SUGGESTIONS:
+            b = Gtk.Button(label=text)
+            b.add_css_class("pill")
+            b.connect("clicked", lambda _b, t=text: self.send_chat(t))
+            flow.append(b)
+            self.suggestion_btns.append(b)
+        empty.set_child(flow)
+        self.c_stack.add_named(empty, "empty")
+
+        self.msg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(self.msg_box, f"set_margin_{side}")(6)
+        self.c_scroll = Gtk.ScrolledWindow(child=self.msg_box, vexpand=True,
+                                           hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.c_stack.add_named(self.c_scroll, "messages")
+        page.append(self.c_stack)
+
+        composer = Gtk.Box(spacing=8)
+        self.new_chat_btn = Gtk.Button(icon_name="list-add-symbolic")
+        self.new_chat_btn.set_tooltip_text("New chat: clear this conversation and start fresh (transcript is kept)")
+        self.new_chat_btn.update_property([Gtk.AccessibleProperty.LABEL], ["New chat"])
+        self.new_chat_btn.connect("clicked", self.on_new_chat)
+        self.entry = Gtk.Entry(hexpand=True, placeholder_text="Ask a question…", width_chars=18)
+        self.entry.connect("activate", lambda _e: self.on_send())
+        self.send_btn = Gtk.Button()
+        self.send_btn.connect("clicked", lambda _b: self.on_send())
+        for w in (self.new_chat_btn, self.entry, self.send_btn):
+            composer.append(w)
+        page.append(composer)
+        return page
+
+    # --- settings --------------------------------------------------
+    def apply_saved_settings(self):
+        s = load_settings()
+        langs = [c for _, c in LANGUAGES]
+        if isinstance(s.get("engine"), int) and 0 <= s["engine"] < len(ENGINES):
+            self.set_engine(s["engine"])
+        if s.get("language") in langs:
+            self.lang_row.set_selected(langs.index(s["language"]))
+        self.system_row.set_active(s.get("system", True))
+        self.mic_row.set_active(s.get("mic", True))
+        self.settings_expander.set_expanded("engine" not in s)  # open on first launch so the choices are visible
+        self.update_settings_summary()
+
+    def current_settings(self):
+        return {"engine": self.get_engine(),
+                "language": LANGUAGES[self.lang_row.get_selected()][1],
+                "system": self.system_row.get_active(), "mic": self.mic_row.get_active()}
+
+    def on_engine_changed(self, *_):
+        if not hasattr(self, "mic_row") or not any(c.get_active() for c in self.engine_checks):
+            return      # still building, or mid-switch between radio buttons
+        engine = ENGINES[self.get_engine()][1]
+        self.lang_row.set_sensitive(engine == "whisper")
+        self.update_settings_summary()
+
+    # --- state machine ---------------------------------------------
+    def set_state(self, state, detail=None):
+        """Single place that decides what every widget shows for each phase."""
+        self.state = state
+        titles = {
+            "idle": ("Ready to record",
+                     "Press Start recording before your Zoom, Lark or other call begins. MeetScribe records your "
+                     "computer's audio output and, if you want, your microphone."),
+            "downloading": ("Downloading the speech model…",
+                            "One-time download. Recording has already started, so nothing is lost."),
+            "loading": ("Loading the speech model…", "Recording has already started, so nothing is lost."),
+            "recording": ("Recording", "The live transcript appears on the right. You can leave this window in "
+                                       "the background during your meeting."),
+            "finishing": ("Finishing the transcription…", "Please keep MeetScribe open until it's done."),
+            "done": ("Transcript saved", "Open “Ask Agent” to summarize it, list action items or ask questions."),
+            "cancelled": ("Stopped", "Recording stopped before transcription could start."),
+            "error": ("Something went wrong", ""),
+        }
+        title, text = titles[state]
+        if state == "finishing" and self.retranscribing:
+            title = "Transcribing again…"
+        self.status_title.set_text(title)
+        self.status_detail.set_text(detail or text)
+
+        busy = state in RECORDING_STATES
+        recording = busy and not self.retranscribing
+        working = state in ("downloading", "loading", "finishing")
+        self.spinner.set_visible(working)
+        self.status_icon.set_visible(not working)
+        self.status_icon.set_from_icon_name({
+            "recording": "media-record-symbolic", "done": "emblem-ok-symbolic",
+            "error": "dialog-warning-symbolic", "cancelled": "dialog-information-symbolic",
+        }.get(state, "audio-input-microphone-symbolic"))
+        self.timer_label.set_visible(recording)
+        self.meters.set_visible(state in ("downloading", "loading", "recording"))
+        self.progress.set_visible(state in ("downloading", "finishing"))
+        self.settings_group.set_sensitive(not busy)
+        self.meeting_list.set_sensitive(not busy)
+        self.new_btn.set_sensitive(not busy)
+        self.bookmark_btn.set_visible(state in ("downloading", "loading", "recording") and not self.retranscribing)
+
+        self.start_btn.remove_css_class("suggested-action")
+        self.start_btn.remove_css_class("destructive-action")
+        if recording:
+            self.start_btn.set_child(self.icon_label("media-playback-stop-symbolic", "Stop recording"))
+            self.start_btn.add_css_class("destructive-action")
+            self.start_btn.set_tooltip_text("Stop recording and finish transcribing what was said")
+        else:
+            self.start_btn.set_child(self.icon_label("media-record-symbolic", "Start recording"))
+            self.start_btn.add_css_class("suggested-action")
+            self.start_btn.set_tooltip_text("Start recording the meeting audio and transcribing it")
+        self.start_btn.set_sensitive(state != "finishing" and not self.retranscribing)
+        self.refresh_buttons()
+        if self.hooks:
+            self.hooks.state_changed()
+
+    def refresh_buttons(self):
+        has_text = bool(self.t_text().strip())
+        busy = self.state in RECORDING_STATES
+        chatting = self.chat is not None and self.chat.busy
+        have_meeting = self.out_dir is not None and self.out_dir.exists()
+        self.copy_t_btn.set_sensitive(has_text)
+        self.ask_btn.set_sensitive(has_text and not busy)
+        editable = has_text and not busy and self.out_dir is not None
+        self.t_view.set_editable(editable)
+        self.t_view.set_cursor_visible(editable)
+        self.edit_hint.set_visible(has_text)
+        self.save_status.set_visible(editable)
+        self.edit_hint.set_text(
+            "Click a time to hear that moment. Click a speaker name to choose who said it. Click anywhere else to "
+            "fix mistakes; changes save automatically (Ctrl+Z undoes)." if editable else
+            "Click a time to hear that moment, or a speaker name to choose who is speaking. Text editing opens "
+            "once the recording has finished.")
+        self.folder_btn.set_sensitive(have_meeting)
+        self.export_btn.set_sensitive(have_meeting and has_text and not busy)
+        has_audio = have_meeting and any((self.out_dir / n).exists() for n in ("audio-meeting.ogg", "audio-mic.ogg"))
+        self.retx_btn.set_visible(has_audio and not busy)
+        self.title_label.set_sensitive(self.out_dir is not None)
+        self.title_hint.set_visible(self.out_dir is not None)
+        self.t_stack.set_visible_child_name("text" if has_text else "empty")
+        self.t_empty.set_description(
+            "Recording. Whisper transcribes after you stop, so there is no live transcript."
+            if busy and self.deferred else
+            "Press Start recording before your meeting begins. The conversation will appear here as people speak.")
+
+        chat_ready = has_text and not busy and self.chat is not None
+        if not chat_ready:
+            self.c_stack.set_visible_child_name("locked")
+        elif self.chat.messages or chatting:
+            self.c_stack.set_visible_child_name("messages")
+        else:
+            self.c_stack.set_visible_child_name("empty")
+        self.entry.set_sensitive(chat_ready and not chatting)
+        self.new_chat_btn.set_sensitive(chat_ready and not chatting and bool(self.chat.messages))
+        for b in self.suggestion_btns:
+            b.set_sensitive(chat_ready and not chatting)
+        self.send_btn.remove_css_class("suggested-action")
+        self.send_btn.remove_css_class("destructive-action")
+        if chatting:
+            self.send_btn.set_child(self.icon_label("media-playback-stop-symbolic", "Stop"))
+            self.send_btn.add_css_class("destructive-action")
+            self.send_btn.set_tooltip_text("Stop Claude's reply")
+            self.send_btn.set_sensitive(True)
+        else:
+            self.send_btn.set_child(self.icon_label("mail-send-symbolic", "Send"))
+            self.send_btn.add_css_class("suggested-action")
+            self.send_btn.set_tooltip_text("Send your question to Claude (Enter)")
+            self.send_btn.set_sensitive(chat_ready)
+
+    # --- recording -------------------------------------------------
+    def on_start_stop(self, _btn):
+        if self.proc is None:
+            self.start()
+        elif not self.retranscribing:
+            self.stop()
+
+    def worker_cmd(self):
+        python = APP_DIR / "venv/bin/python"
+        if not python.exists():
+            self.set_state("error", "The speech engine isn't installed. Run install.sh in the meetscribe folder.")
+            return None
+        cmd = [str(python), str(APP_DIR / "worker.py")]
+        if not prefs()["speakers"]:
+            cmd.append("--no-speakers")
+        return cmd
+
+    def start(self):
+        if self.proc is not None:
+            return
+        self.flush_transcript_save()
+        self.stop_playback()
+        cfg = self.current_settings()
+        self.settings_expander.set_expanded(False)
+        if not cfg["system"] and not cfg["mic"]:
+            self.toast("Turn on “Record meeting audio”, “Record my microphone”, or both.")
+            return
+        cmd = self.worker_cmd()
+        if cmd is None:
+            return
+        save_settings(cfg)
+        _, engine, model = ENGINES[cfg["engine"]][:3]
+        self.out_dir = MEETINGS_DIR / time.strftime("%Y-%m-%d_%H%M%S")
+        meetings.save_meta(self.out_dir, started=datetime.datetime.now().isoformat(timespec="seconds"),
+                           engine=engine)
+        self.chat = None
+        self.speaker_map = {}
+        self.live_names = {}
+        self.segments = []
+        self.bookmarks = []
+        self.render_bookmarks()
+        self.clear_chat_view()
+        self.loading_transcript = True
+        self.t_buf.set_text("")
+        self.loading_transcript = False
+        self.peaks = {"them": 0.0, "you": 0.0}
+        self.heard = {"them": False, "you": False}
+        self.last_error = None
+        self.deferred = False
+        self.retranscribing = False
+        self.banner.set_revealed(False)
+        self.stack.set_visible_child_name("transcript")
+        cmd += ["--out", str(self.out_dir), "--engine", engine]
+        if engine == "whisper":
+            cmd += ["--model", model, "--language", cfg["language"]]
+        if not cfg["system"]:
+            cmd.append("--no-system")
+        if not cfg["mic"]:
+            cmd.append("--no-mic")
+        if os.environ.get("MEETSCRIBE_SYSTEM_SOURCE"):
+            cmd += ["--system-source", os.environ["MEETSCRIBE_SYSTEM_SOURCE"]]
+        if not self.launch(cmd):
+            return
+        self.record_start = time.monotonic()
+        self.timer_label.set_text("00:00:00")
+        self.set_state("loading")
+        self.update_title()
+        self.refresh_sidebar()
+
+    def launch(self, cmd):
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except OSError as e:
+            self.set_state("error", f"Could not start the recorder: {e}")
+            return False
+        threading.Thread(target=self.read_output, args=(self.proc,), daemon=True).start()
+        return True
+
+    def stop(self):
+        if self.proc is None or self.retranscribing:
+            return
+        self.banner.set_revealed(False)
+        self.set_state("finishing", "Stopping the recording…")
+        self.progress.set_fraction(0)
+        self.progress.set_text("Preparing…")
+        self.proc.send_signal(signal.SIGTERM)
+
+    def read_output(self, proc):
+        for line in proc.stdout:
+            GLib.idle_add(self.on_line, line.rstrip("\n"))
+        proc.wait()
+        GLib.idle_add(self.on_exit, proc, proc.returncode)
+
+    def on_line(self, line):
+        if line.startswith("LEVEL: "):
+            for part in line[7:].split():
+                key, _, val = part.partition("=")
+                if key in self.peaks:
+                    self.update_meter(key, float(val))
+        elif line.startswith("STATE: "):
+            words = line[7:].split()
+            word, opts = words[0], dict(w.split("=", 1) for w in words[1:] if "=" in w)
+            if word == "downloading" and (self.state in ("loading", "downloading") or self.retranscribing):
+                if not self.retranscribing:
+                    self.set_state("downloading")
+                if "pct" in opts:
+                    self.progress.set_fraction(int(opts["pct"]) / 100)
+                    self.progress.set_text(f"Downloading a speech model: {opts['pct']}%")
+                else:
+                    self.progress.pulse()
+                    self.progress.set_text("Downloading a speech model…")
+            elif word == "loading" and self.state == "downloading":
+                self.set_state("loading")
+            elif word == "loading" and self.state == "finishing":
+                self.status_detail.set_text("Loading the speech model…")
+            elif word == "recording" and "deferred" in words:
+                self.deferred = True
+                self.set_state("recording", "Recording. Whisper will transcribe after you stop, so your computer "
+                                            "stays fast during the call.")
+            elif word == "recording" and self.state in ("loading", "downloading", "recording"):
+                backlog = int(opts.get("backlog", 0))
+                if backlog > 3:
+                    self.set_state("recording", f"Transcription is {backlog} segments behind. It will catch up; "
+                                                "nothing is lost.")
+                elif self.state != "recording" or self.status_detail.get_text().startswith("Transcription is"):
+                    self.set_state("recording")
+            elif word == "finishing" and "speakers" in words:
+                self.progress.pulse()
+                self.progress.set_text("Telling speakers apart…")
+            elif word == "finishing":
+                done, total = int(opts.get("done", 0)), int(opts.get("total", 0))
+                if self.state != "finishing":
+                    self.set_state("finishing")
+                self.status_detail.set_text("Please keep MeetScribe open until it's done.")
+                self.progress.set_fraction(done / total if total else 1)
+                self.progress.set_text(f"Transcribed {done} of {total} speech segments")
+        elif line.startswith("NOTICE: "):
+            self.toast(line[8:])
+        elif line.startswith("ERROR: "):
+            self.last_error = line[7:]
+        elif LINE_RE.match(line):
+            self.append_transcript_line(line, live=True)
+            self.refresh_buttons()
+        return False
+
+    def update_meter(self, key, rms):
+        bar, note = (self.them_bar, self.them_note) if key == "them" else (self.you_bar, self.you_note)
+        bar.set_value(level_fraction(rms))
+        self.peaks[key] = max(self.peaks[key], rms)
+        if rms > 0.003:
+            self.heard[key] = True
+            note.set_text("hearing audio")
+        elif not self.heard[key]:
+            note.set_text("silent")
+
+    def on_exit(self, proc, code):
+        if proc is not self.proc:
+            return False
+        self.proc = None
+        again = self.retranscribing
+        self.retranscribing = False
+        self.banner.set_revealed(False)
+        if not again and self.out_dir is not None and self.out_dir.exists():
+            meetings.save_meta(self.out_dir, duration=int(time.monotonic() - self.record_start))
+        if self.last_error:
+            self.set_state("error", self.last_error)
+            if again:
+                self.show_transcript_file(self.out_dir)
+        elif code == 0 and (self.out_dir / "transcript.txt").exists():
+            self.show_transcript_file(self.out_dir)
+            self.learn_from_map()
+            self.chat = chat.Chat(self.out_dir)
+            self.render_chat()
+            if again:
+                self.set_state("done", "Transcribed again. Your previous transcript is kept in the meeting folder.")
+            elif self.t_text().strip():
+                self.set_state("done", f"Saved in {self.short(self.out_dir)}. Open “Ask Agent” to summarize "
+                                       "it, list action items or ask questions.")
+            else:
+                self.set_state("done", "No speech was detected. Next time, check the level meters to confirm "
+                                       "the meeting audio is coming through.")
+        elif code == 0:
+            self.set_state("cancelled", f"Stopped before the speech model was ready. The audio is saved in "
+                                        f"{self.short(self.out_dir)}.")
+        else:
+            self.set_state("error", f"The recorder stopped unexpectedly (exit code {code}).")
+        self.update_title()
+        self.refresh_sidebar()
+        if self.quit_after_stop:
+            self.quit_after_stop = False
+            if self.hooks:
+                self.hooks.quit_now()
+            else:
+                self.destroy()
+        return False
+
+    def on_tick(self):
+        if self.proc is not None and not self.retranscribing and self.state in ("downloading", "loading", "recording"):
+            elapsed = int(time.monotonic() - self.record_start)
+            self.timer_label.set_text(meetings.fmt_time(elapsed))
+            if elapsed >= NO_AUDIO_AFTER:
+                cfg = self.current_settings()
+                if cfg["system"] and not self.heard["them"]:
+                    self.banner.set_title("No meeting audio yet. Make sure the meeting plays through your "
+                                          "computer's default speakers or headphones.")
+                    self.banner.set_revealed(True)
+                elif cfg["mic"] and not self.heard["you"]:
+                    self.banner.set_title("Your microphone seems silent. Check that it isn't muted.")
+                    self.banner.set_revealed(True)
+                else:
+                    self.banner.set_revealed(False)
+        return True
+
+    # --- meetings list, title, new meeting ---------------------------------
+    def refresh_sidebar(self):
+        while (child := self.meeting_list.get_first_child()) is not None:
+            self.meeting_list.remove(child)
+        folders = meetings.list_meetings(MEETINGS_DIR)
+        live = self.out_dir if self.proc is not None and not self.retranscribing else None
+        if live is not None and live not in folders:
+            folders.insert(0, live)
+        for folder in folders:
+            row = Gtk.ListBoxRow()
+            row.folder = folder
+            box = Gtk.Box(spacing=6, margin_top=4, margin_bottom=4)
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            name = Gtk.Label(label=meetings.title(folder), xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
+            name.add_css_class("heading")
+            info = Gtk.Label(label="Recording now…" if folder == live else meetings.describe(folder), xalign=0,
+                             wrap=True)
+            info.add_css_class("dim-label")
+            info.add_css_class("caption")
+            texts.append(name)
+            texts.append(info)
+            box.append(texts)
+            trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+            trash.add_css_class("flat")
+            trash.set_tooltip_text("Move this meeting to the Trash")
+            trash.update_property([Gtk.AccessibleProperty.LABEL], [f"Delete {meetings.title(folder)}"])
+            trash.connect("clicked", lambda _b, f=folder: self.confirm_delete(f))
+            trash.set_sensitive(folder != live)
+            box.append(trash)
+            row.set_child(box)
+            self.meeting_list.append(row)
+            if self.out_dir is not None and folder == self.out_dir:
+                self.meeting_list.select_row(row)
+        self.meeting_empty.set_visible(not folders)
+
+    def on_meeting_row(self, _list, row):
+        if self.proc is not None:
+            self.toast("Stop the recording first.")
+            return
+        self.load_folder(row.folder)
+        if self.split.get_collapsed():
+            self.split.set_show_sidebar(False)
+
+    def confirm_delete(self, folder):
+        dialog = Adw.AlertDialog(heading=f"Move “{meetings.title(folder)}” to the Trash?",
+                                 body="Its transcript, audio, chat and bookmarks go to the Trash, "
+                                      "so you can still restore them from there.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Move to Trash")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, r: r == "delete" and self.delete_meeting(folder))
+        self.delete_dialog = dialog
+        dialog.present(self)
+
+    def delete_meeting(self, folder):
+        try:
+            Gio.File.new_for_path(str(folder)).trash(None)
+        except GLib.Error as e:
+            self.toast(f"Couldn't move it to the Trash: {e.message}")
+            return
+        if self.out_dir is not None and folder == self.out_dir:
+            self.new_meeting()
+        self.refresh_sidebar()
+        self.toast("Moved to the Trash")
+
+    def new_meeting(self):
+        if self.proc is not None:
+            return
+        self.flush_transcript_save()
+        self.stop_playback()
+        self.out_dir = None
+        self.chat = None
+        self.speaker_map = {}
+        self.segments = []
+        self.bookmarks = []
+        self.render_bookmarks()
+        self.clear_chat_view()
+        self.loading_transcript = True
+        self.t_buf.set_text("")
+        self.loading_transcript = False
+        self.stack.set_visible_child_name("transcript")
+        self.set_state("idle")
+        self.update_title()
+        self.refresh_sidebar()
+
+    def update_title(self):
+        self.title_label.set_text(meetings.title(self.out_dir) if self.out_dir is not None else "New meeting")
+
+    def on_title_editing(self, label, _param):
+        if label.get_editing() or self.out_dir is None:
+            return
+        text = " ".join(label.get_text().split())
+        if text and text != meetings.title(self.out_dir):
+            meetings.save_meta(self.out_dir, title=text)
+            self.refresh_sidebar()
+        self.update_title()
+
+    # --- transcript ------------------------------------------------
+    def append_transcript_line(self, line, live=False):
+        m = LINE_RE.match(line)
+        if m and live and m.group(2) in self.live_names:        # you already named this voice during the call
+            name = self.live_names[m.group(2)]
+            self.speaker_map[self.line_key(m.group(1), m.group(3))] = name
+            self.save_speaker_map()
+            line = f"[{m.group(1)}] {name}: {m.group(3)}"
+            m = LINE_RE.match(line)
+        self.loading_transcript = True
+        end = self.t_buf.get_end_iter
+        if m:
+            stamp, who, text = m.groups()
+            self.t_buf.insert_with_tags_by_name(end(), stamp, "time")
+            self.t_buf.insert(end(), "  ")
+            self.t_buf.insert_with_tags_by_name(end(), who, self.speaker_tag(who), "speaker-link")
+            self.t_buf.insert(end(), "  ")
+            self.t_buf.insert(end(), text + "\n")
+        else:
+            self.t_buf.insert(end(), line + "\n")
+        self.loading_transcript = False
+        if live:
+            mark = self.t_buf.create_mark(None, end(), False)
+            self.t_view.scroll_to_mark(mark, 0.0, False, 0.0, 0.0)
+
+    def show_transcript_file(self, folder):
+        self.flush_transcript_save()
+        path = chat.transcript_path(folder)
+        self.loading_transcript = True
+        self.t_buf.set_text("")
+        self.loading_transcript = False
+        self.speaker_map = self.load_speaker_map(folder)
+        self.segments = self.load_segments(folder)
+        changed = False
+        if path:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                m = LINE_RE.match(line)
+                name = self.speaker_map.get(self.line_key(m.group(1), m.group(3))) if m else None
+                # only fill in lines still carrying the recorder's label, never undo a name you typed later
+                if name and name != m.group(2) and BASE_LABEL_RE.match(m.group(2)):
+                    line = f"[{m.group(1)}] {name}: {m.group(3)}"
+                    changed = True
+                if line.strip():
+                    self.append_transcript_line(line)
+        self.t_buf.set_enable_undo(False)   # forget the load itself, so Ctrl+Z only undoes your edits
+        self.t_buf.set_enable_undo(True)
+        self.save_status.set_text("")
+        if changed:     # speakers picked during the recording: write them into transcript.txt
+            self.save_transcript()
+
+    def on_transcript_edited(self, _buf):
+        if self.loading_transcript or not self.t_view.get_editable():
+            return
+        self.save_status.set_text("Saving…")
+        if self.save_timer:
+            GLib.source_remove(self.save_timer)
+        self.save_timer = GLib.timeout_add(SAVE_DELAY_MS, self.save_transcript)
+
+    def flush_transcript_save(self):
+        """Write a pending edit now (before switching meetings, chatting or closing)."""
+        if self.save_timer:
+            GLib.source_remove(self.save_timer)
+            self.save_transcript()
+
+    def save_transcript(self):
+        self.save_timer = 0
+        if self.out_dir is None:
+            return False
+        lines = []
+        for line in self.t_text().splitlines():
+            m = SCREEN_RE.match(line)
+            if m:
+                lines.append(f"[{m.group(1)}] {m.group(2).strip()}: {m.group(3)}")
+            elif line.strip():
+                lines.append(line)
+        target = self.out_dir / "transcript.txt"
+        original = self.out_dir / "transcript.original.txt"
+        try:
+            if target.exists() and not original.exists():
+                original.write_bytes(target.read_bytes())       # keep the machine transcript once
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tmp.replace(target)
+        except OSError as e:
+            self.save_status.set_text("Not saved")
+            self.toast(f"Couldn't save the transcript: {e}")
+            return False
+        self.retag_transcript()
+        self.save_status.set_text("All changes saved")
+        return False
+
+    def retag_transcript(self):
+        """Re-apply the time / speaker colours after edits."""
+        buf = self.t_buf
+        buf.remove_all_tags(buf.get_start_iter(), buf.get_end_iter())
+        for n in range(buf.get_line_count()):
+            info = self.line_info(n)
+            if info is None:
+                continue
+            start, _end, m = info
+            offset = start.get_offset()
+            who_start = offset + len(m.group(1)) + 2
+            buf.apply_tag_by_name("time", buf.get_iter_at_offset(offset), buf.get_iter_at_offset(offset + 8))
+            for tag in (self.speaker_tag(m.group(2)), "speaker-link"):
+                buf.apply_tag_by_name(tag, buf.get_iter_at_offset(who_start),
+                                      buf.get_iter_at_offset(who_start + len(m.group(2))))
+
+    @staticmethod
+    def speaker_tag(name):
+        """Each person keeps the same colour; you are green, unknown voices plain blue."""
+        if name == "You":
+            return "you"
+        if name == "Them":
+            return "them"
+        return f"spk{sum(map(ord, name)) % len(SPEAKER_COLOURS)}"
+
+    @staticmethod
+    def short(path):
+        home = str(pathlib.Path.home())
+        return "~" + str(path)[len(home):] if str(path).startswith(home + "/") else str(path)
+
+    def t_text(self):
+        return self.t_buf.get_text(self.t_buf.get_start_iter(), self.t_buf.get_end_iter(), False)
+
+    def copy(self, text, message):
+        if not text.strip():
+            return
+        self.get_clipboard().set(text)
+        self.toast(message)
+
+    def toast(self, message, button=None, action=None):
+        t = Adw.Toast(title=message, timeout=5)
+        if button:
+            t.set_button_label(button)
+            t.connect("button-clicked", lambda _t: action())
+        self.toasts.add_toast(t)
+
+    # --- playback ------------------------------------------------------
+    @staticmethod
+    def load_segments(folder):
+        try:
+            return json.loads((pathlib.Path(folder) / "segments.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+
+    def line_audio(self, n):
+        """(audio file, start seconds, duration) for transcript line n."""
+        info = self.line_info(n)
+        if info is None or self.out_dir is None:
+            return None
+        _s, _e, m = info
+        start, mine = secs(m.group(1)), m.group(2) == "You"
+        path = self.out_dir / ("audio-mic.ogg" if mine else "audio-meeting.ogg")
+        seg = next((g for g in self.segments if int(g["start"]) == start and (g["stream"] == "You") == mine), None)
+        if seg:
+            return path, seg["start"], seg["end"] - seg["start"] + 0.4
+        later = [secs(i[2].group(1)) for k in range(n + 1, n + 8) if (i := self.line_info(k)) and
+                 (i[2].group(2) == "You") == mine]
+        return path, start, min(max((later[0] - start) if later else 15, 3), 30)
+
+    def play_line(self, n):
+        audio = self.line_audio(n)
+        if audio:
+            self.play(*audio, label=self.line_info(n)[2].group(1))
+
+    def play(self, path, start, duration, label):
+        self.stop_playback()
+        if not shutil.which("ffplay"):
+            self.toast("Playing audio needs ffplay: sudo apt install ffmpeg")
+            return
+        if not path.exists():
+            self.toast("There's no saved audio for that part of the meeting.")
+            return
+        self.player = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                                        "-ss", f"{max(0.0, start - 0.3):.1f}", "-t", f"{duration:.1f}", str(path)],
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+        self.playing_label = label
+        self.play_label.set_text(f"Playing from {label} ({'your microphone' if 'mic' in path.name else 'meeting audio'})")
+        self.play_box.set_visible(True)
+        GLib.timeout_add(300, self.check_player)
+
+    def check_player(self):
+        if self.player is None:
+            return False
+        if self.player.poll() is not None:
+            self.player = None
+            self.play_box.set_visible(False)
+            return False
+        return True
+
+    def stop_playback(self):
+        if self.player is not None:
+            if self.player.poll() is None:
+                self.player.terminate()
+            self.player = None
+        self.play_box.set_visible(False)
+
+    # --- bookmarks -------------------------------------------------------
+    def add_bookmark(self):
+        if self.proc is None or self.retranscribing or self.state not in ("downloading", "loading", "recording"):
+            return
+        t = round(time.monotonic() - self.record_start, 1)
+        self.bookmarks.append({"t": t, "note": ""})
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            meetings.save_bookmarks(self.out_dir, self.bookmarks)
+        except OSError as e:
+            self.toast(f"Couldn't save the bookmark: {e}")
+        self.render_bookmarks()
+        self.toast(f"Bookmarked {meetings.fmt_time(t)}")
+        if self.hooks:
+            self.hooks.state_changed()
+
+    def nearest_line(self, t):
+        best = None
+        for n in range(self.t_buf.get_line_count()):
+            info = self.line_info(n)
+            if info and secs(info[2].group(1)) <= t + 1:
+                best = n
+        return best
+
+    def render_bookmarks(self):
+        for row in self.bm_rows:
+            self.bm_group.remove(row)
+        self.bm_rows = []
+        for i, b in enumerate(self.bookmarks):
+            n = self.nearest_line(b["t"])
+            said = self.line_info(n)[2].group(3) if n is not None else "Nothing transcribed at this point yet."
+            row = Adw.ActionRow(title=f"★  {meetings.fmt_time(b['t'])}", subtitle=said, activatable=True)
+            row.connect("activated", lambda _r, t=b["t"]: self.jump_to(t))
+            play = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER)
+            play.add_css_class("flat")
+            play.set_tooltip_text("Hear this moment")
+            play.connect("clicked", lambda _b, t=b["t"]: self.play(self.out_dir / "audio-meeting.ogg", t - 5, 20,
+                                                                    meetings.fmt_time(t)))
+            remove = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+            remove.add_css_class("flat")
+            remove.set_tooltip_text("Remove this bookmark")
+            remove.connect("clicked", lambda _b, k=i: self.delete_bookmark(k))
+            row.add_suffix(play)
+            row.add_suffix(remove)
+            self.bm_group.add(row)
+            self.bm_rows.append(row)
+        self.bm_group.set_visible(bool(self.bookmarks))
+
+    def delete_bookmark(self, index):
+        if 0 <= index < len(self.bookmarks):
+            del self.bookmarks[index]
+            if self.out_dir is not None:
+                meetings.save_bookmarks(self.out_dir, self.bookmarks)
+            self.render_bookmarks()
+
+    def jump_to(self, t):
+        n = self.nearest_line(t)
+        if n is None:
+            return
+        self.stack.set_visible_child_name("transcript")
+        start = self.t_buf.get_iter_at_line(n)[1]
+        end = start.copy()
+        end.forward_to_line_end()
+        self.t_buf.apply_tag_by_name("flash", start, end)
+        self.t_view.scroll_to_iter(start, 0.1, True, 0.0, 0.3)
+        GLib.timeout_add(2500, lambda: self.t_buf.remove_tag_by_name(
+            "flash", self.t_buf.get_start_iter(), self.t_buf.get_end_iter()) or False)
+
+    # --- chat --------------------------------------------------------
+    def clear_chat_view(self):
+        while (child := self.msg_box.get_first_child()) is not None:
+            self.msg_box.remove(child)
+        self.reply_label = None
+
+    def render_chat(self):
+        self.clear_chat_view()
+        for m in self.chat.messages if self.chat else []:
+            if m["role"] == "user":
+                self.add_user_bubble(m["text"])
+            else:
+                set_markdown(self.add_assistant_bubble(m["text"]), m["text"])
+        self.refresh_buttons()
+
+    def add_user_bubble(self, text):
+        label = Gtk.Label(label=text, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, xalign=0, selectable=True,
+                          max_width_chars=60)
+        label.add_css_class("user-bubble")
+        row = Gtk.Box(halign=Gtk.Align.END, margin_start=80)
+        row.append(label)
+        self.msg_box.append(row)
+        self.scroll_chat()
+
+    def add_assistant_bubble(self, text_for_copy):
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.START, margin_end=40)
+        author = Gtk.Label(label="Claude", xalign=0)
+        author.add_css_class("bubble-author")
+        author.add_css_class("dim-label")
+        bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bubble.add_css_class("assistant-bubble")
+        label = Gtk.Label(wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, xalign=0, selectable=True,
+                          max_width_chars=80)
+        bubble.append(label)
+        copy_btn = Gtk.Button(child=self.icon_label("edit-copy-symbolic", "Copy"), halign=Gtk.Align.START)
+        copy_btn.add_css_class("flat")
+        copy_btn.set_tooltip_text("Copy this reply")
+        copy_btn.connect("clicked", lambda _b: self.copy(label.reply_text, "Reply copied"))
+        label.reply_text = text_for_copy
+        label.copy_btn = copy_btn
+        for w in (author, bubble, copy_btn):
+            col.append(w)
+        self.msg_box.append(col)
+        self.scroll_chat()
+        return label
+
+    def scroll_chat(self):
+        def go():
+            adj = self.c_scroll.get_vadjustment()
+            adj.set_value(adj.get_upper())
+            return False
+        GLib.timeout_add(50, go)
+
+    def on_send(self):
+        if self.chat is not None and self.chat.busy:
+            self.chat.cancel()
+            return
+        text = self.entry.get_text().strip()
+        if text:
+            self.send_chat(text)
+
+    def send_chat(self, text):
+        if self.chat is None or self.chat.busy or not text.strip():
+            return
+        self.flush_transcript_save()      # the agent should see your corrections
+        self.entry.set_text("")
+        self.c_stack.set_visible_child_name("messages")
+        self.add_user_bubble(text)
+        self.reply_text = ""
+        self.reply_label = self.add_assistant_bubble("")
+        self.reply_label.set_text("Claude is thinking…")
+        self.reply_label.add_css_class("dim-label")
+        self.reply_label.copy_btn.set_visible(False)
+        self.chat.send(text, lambda chunk: GLib.idle_add(self.on_chat_delta, chunk),
+                       lambda full, err: GLib.idle_add(self.on_chat_done, full, err),
+                       participants=self.agent_context())
+        self.refresh_buttons()
+
+    def on_chat_delta(self, chunk):
+        if self.reply_label is None:
+            return False
+        self.reply_text += chunk
+        self.reply_label.remove_css_class("dim-label")
+        set_markdown(self.reply_label, self.reply_text)
+        self.scroll_chat()
+        return False
+
+    def on_chat_done(self, full, error):
+        label = self.reply_label
+        self.reply_label = None
+        if label is not None:
+            label.remove_css_class("dim-label")
+            text = full or self.reply_text
+            if text:
+                set_markdown(label, text)
+                label.reply_text = text
+                label.copy_btn.set_visible(True)
+            if error:
+                note = Gtk.Label(label=error, xalign=0, wrap=True)
+                note.add_css_class("error" if error != "Stopped." else "dim-label")
+                label.get_parent().append(note)
+                if not text:
+                    label.set_text("No reply.")
+        if error and error != "Stopped.":
+            self.toast("Claude couldn't answer. See the message in the chat.")
+        self.refresh_buttons()
+        self.entry.grab_focus()
+        return False
+
+    def on_new_chat(self, _btn):
+        if self.chat is None or self.chat.busy:
+            return
+        self.chat.reset()
+        self.render_chat()
+        self.toast("Started a new chat")
+
+    def agent_context(self):
+        """Extra notes for the agent: who took part (with emails) and the moments you bookmarked."""
+        parts = []
+        note = self.participants_note()
+        if note:
+            parts.append(note)
+        if self.bookmarks:
+            parts.append("The user bookmarked these moments as important; pay extra attention to what was said "
+                         "around them:\n" + "\n".join(f"- {meetings.fmt_time(b['t'])}" for b in self.bookmarks))
+        return "\n\n".join(parts)
+
+    # --- speakers ----------------------------------------------------
+    def open_speakers_dialog(self):
+        if self.speaker_popover is not None:
+            self.speaker_popover.popdown()
+        self.speakers_dialog = speakers.SpeakersDialog(on_changed=lambda: None)
+        self.speakers_dialog.present(self)
+
+    @staticmethod
+    def line_key(stamp, text):
+        return f"{stamp}|{text.strip()[:40]}"
+
+    @staticmethod
+    def load_speaker_map(folder):
+        try:
+            return json.loads((pathlib.Path(folder) / "speaker_map.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def save_speaker_map(self):
+        if self.out_dir is None:
+            return
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            (self.out_dir / "speaker_map.json").write_text(json.dumps(self.speaker_map, indent=1), encoding="utf-8")
+        except OSError as e:
+            self.toast(f"Couldn't save the speaker choice: {e}")
+
+    def line_info(self, n):
+        """(start iter, end iter, regex match) for transcript line n, or None if it isn't a speaker line."""
+        if n is None:
+            return None
+        ok, start = self.t_buf.get_iter_at_line(n)
+        if not ok:
+            return None
+        end = start.copy()
+        if not end.ends_line():
+            end.forward_to_line_end()
+        m = SCREEN_RE.match(self.t_buf.get_text(start, end, False))
+        return (start, end, m) if m else None
+
+    def on_transcript_clicked(self, _gesture, _n_press, x, y):
+        bx, by = self.t_view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
+        ok, it = self.t_view.get_iter_at_location(bx, by)
+        if not ok:
+            return
+        line = it.get_line()
+        info = self.line_info(line)
+        if info is None:
+            return
+        start, _end, m = info
+        col = it.get_offset() - start.get_offset()
+        if col < len(m.group(1)):
+            if self.player is not None and getattr(self, "playing_label", None) == m.group(1):
+                self.stop_playback()
+            else:
+                self.play_line(line)
+            return
+        who_start = len(m.group(1)) + 2
+        if not who_start <= col <= who_start + len(m.group(2)):
+            return      # clicked the text, not the speaker name
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self.show_speaker_popover(line, m.group(2), rect)
+
+    def show_speaker_popover(self, line, current, rect):
+        if self.speaker_popover is None:
+            self.speaker_popover = Gtk.Popover(has_arrow=True)
+            self.speaker_popover.set_parent(self.t_view)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(6)
+        title = Gtk.Label(label="Who is speaking?", xalign=0)
+        title.add_css_class("heading")
+        box.append(title)
+        group = bool(SPEAKER_N_RE.match(current))
+        follow = Gtk.CheckButton(
+            label=f"All lines from {current}" if group else "Also the following “Them” lines\n(until someone else speaks)",
+            active=group)
+        people = speakers.load()
+        if not people:
+            note = Gtk.Label(label="No speakers yet.", xalign=0)
+            note.add_css_class("dim-label")
+            box.append(note)
+        learned = voices.load()
+        for person in people:
+            label = person["name"] + ("  ✓" if person["name"] == current else "")
+            b = Gtk.Button(label=label)
+            b.add_css_class("flat")
+            b.get_child().set_xalign(0)
+            tip = [person.get("email") or "", "Voice learned" if person["name"] in learned else ""]
+            if any(tip):
+                b.set_tooltip_text(" · ".join(t for t in tip if t))
+            b.connect("clicked", lambda _b, name=person["name"]: self.assign_speaker(line, name, follow.get_active()))
+            box.append(b)
+        box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
+        for name, caption in (("You", "You (your microphone)"), ("Them", "Them (unknown)")):
+            b = Gtk.Button(label=caption + ("  ✓" if name == current else ""))
+            b.add_css_class("flat")
+            b.get_child().set_xalign(0)
+            b.connect("clicked", lambda _b, n=name: self.assign_speaker(line, n, follow.get_active()))
+            box.append(b)
+        if people or group:
+            box.append(follow)
+        manage = Gtk.Button(child=self.icon_label("system-users-symbolic", "Add or remove speakers…"))
+        manage.add_css_class("flat")
+        manage.connect("clicked", lambda _b: self.open_speakers_dialog())
+        box.append(manage)
+        self.speaker_popover.set_child(box)
+        self.speaker_popover.set_pointing_to(rect)
+        self.speaker_popover.popup()
+
+    def assign_speaker(self, line, name, follow=False):
+        """Give transcript line `line` to `name`; with `follow`, also every line of that detected speaker
+        (for "Speaker N") or the following unnamed "Them" lines."""
+        if self.speaker_popover is not None:
+            self.speaker_popover.popdown()
+        info = self.line_info(line)
+        if info is None:
+            return
+        current = info[2].group(2)
+        targets = [line]
+        if follow and SPEAKER_N_RE.match(current):
+            targets = [n for n in range(self.t_buf.get_line_count())
+                       if (i := self.line_info(n)) is not None and i[2].group(2) == current]
+            if self.proc is not None and not self.retranscribing:
+                self.live_names[current] = name     # later lines from this voice follow your choice
+        elif follow:
+            n = line + 1
+            while (i := self.line_info(n)) is not None and i[2].group(2) == "Them":
+                targets.append(n)
+                n += 1
+        samples = []
+        for n in targets:
+            i = self.line_info(n)
+            if i is None:
+                continue
+            start, _end, m = i
+            who_start = start.get_offset() + len(m.group(1)) + 2
+            a = self.t_buf.get_iter_at_offset(who_start)
+            b = self.t_buf.get_iter_at_offset(who_start + len(m.group(2)))
+            self.t_buf.begin_user_action()
+            self.t_buf.delete(a, b)
+            self.t_buf.insert_with_tags_by_name(self.t_buf.get_iter_at_offset(who_start), name,
+                                                self.speaker_tag(name), "speaker-link")
+            self.t_buf.end_user_action()
+            self.speaker_map[self.line_key(m.group(1), m.group(3))] = name
+            samples += self.voice_samples(m.group(1), m.group(3))
+        self.save_speaker_map()
+        if self.t_view.get_editable():
+            self.flush_transcript_save()     # write it now rather than after the usual pause
+        who = "you" if name == "You" else name
+        msg = f"{len(targets)} line{'s' if len(targets) > 1 else ''} assigned to {who}"
+        if name not in ("You", "Them") and samples:
+            voices.learn(name, samples)
+            msg += f". Voice learned, so {name} will be recognised in future meetings"
+        self.toast(msg)
+
+    def voice_samples(self, stamp, text):
+        """(voiceprint, seconds) of the recorded segment behind a transcript line, if any."""
+        t = secs(stamp)
+        for g in self.segments:
+            if int(g["start"]) == t and g.get("emb") and g["text"].strip()[:40] == text.strip()[:40]:
+                return [(g["emb"], g["end"] - g["start"])]
+        return []
+
+    def learn_from_map(self):
+        """After a meeting, learn the voices of people you named during it."""
+        by_name = {}
+        for key, name in self.speaker_map.items():
+            if name in ("You", "Them") or "|" not in key:
+                continue
+            stamp, text = key.split("|", 1)
+            by_name.setdefault(name, []).extend(self.voice_samples(stamp, text))
+        for name, samples in by_name.items():
+            if samples:
+                voices.learn(name, samples)
+
+    def participants_note(self):
+        """Names (and emails) of saved speakers who appear in this transcript, for the agent."""
+        names = {m.group(2) for m in map(SCREEN_RE.match, self.t_text().splitlines()) if m}
+        found = [p for p in speakers.load() if p["name"] in names]
+        if not found:
+            return ""
+        return "Known participants in this meeting:\n" + "\n".join(
+            f"- {p['name']}" + (f" <{p['email']}>" if p.get("email") else "") for p in found)
+
+    # --- export --------------------------------------------------------
+    def open_export_dialog(self):
+        if self.out_dir is None:
+            return
+        self.flush_transcript_save()
+        messages = self.chat.messages if self.chat else []
+        summary = meetings.summary_reply(messages)
+        dialog = Adw.Dialog(title="Export meeting", content_width=460)
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+        dialog.set_child(view)
+
+        fmt_group = Adw.PreferencesGroup(title="Format")
+        checks = []
+        for name, ext, info in EXPORT_FORMATS:
+            check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            if checks:
+                check.set_group(checks[0])
+            row = Adw.ActionRow(title=f"{name} ({ext})", subtitle=info, activatable_widget=check)
+            row.add_prefix(check)
+            fmt_group.add(row)
+            checks.append(check)
+        checks[0].set_active(True)
+        inc = Adw.PreferencesGroup(title="Include")
+        rows = {
+            "summary": Adw.SwitchRow(title="Summary", active=bool(summary), sensitive=bool(summary),
+                                     subtitle="The agent's latest summary of this meeting." if summary else
+                                     "Ask the agent to “Summarize the meeting” first."),
+            "conversation": Adw.SwitchRow(title="Ask Agent conversation", active=False, sensitive=bool(messages),
+                                          subtitle="Every question and answer from the chat."),
+            "bookmarks": Adw.SwitchRow(title="Bookmarks", active=bool(self.bookmarks), sensitive=bool(self.bookmarks),
+                                       subtitle="The moments you marked as important."),
+            "transcript": Adw.SwitchRow(title="Transcript", active=True,
+                                        subtitle="Everything that was said, with times and speakers."),
+        }
+        for r in rows.values():
+            inc.add(r)
+        go = Gtk.Button(label="Export…", halign=Gtk.Align.CENTER, margin_top=12)
+        go.add_css_class("suggested-action")
+        go.add_css_class("pill")
+        go.connect("clicked", lambda _b: self.choose_export_file(
+            EXPORT_FORMATS[next(i for i, c in enumerate(checks) if c.get_active())][1],
+            {k: r.get_active() for k, r in rows.items()}))
+        inc.add(go)
+        page.add(fmt_group)
+        page.add(inc)
+        self.export_dialog = dialog
+        self.export_checks = checks
+        self.export_rows = rows
+        dialog.present(self)
+
+    def choose_export_file(self, ext, options):
+        name = re.sub(r"[^\w\- ,.]+", "", meetings.title(self.out_dir)).strip() or "meeting"
+        dialog = Gtk.FileDialog(title="Export meeting", initial_name=f"{name}{ext}")
+        docs = pathlib.Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS) or pathlib.Path.home())
+        dialog.set_initial_folder(Gio.File.new_for_path(str(docs)))
+
+        def done(d, result):
+            try:
+                target = pathlib.Path(d.save_finish(result).get_path())
+            except GLib.Error:
+                return
+            if target.suffix.lower() != ext:
+                target = target.with_name(target.name + ext)
+            self.export_to(target, options)
+        dialog.save(self, None, done)
+
+    def export_to(self, target, options, on_done=None):
+        """Write the export; .md directly, .docx/.pdf through export.py in MeetScribe's own Python."""
+        messages = self.chat.messages if self.chat else []
+        people = []
+        names = {m.group(2) for m in map(SCREEN_RE.match, self.t_text().splitlines()) if m}
+        for p in speakers.load():
+            if p["name"] in names:
+                people.append(p["name"] + (f" <{p['email']}>" if p.get("email") else ""))
+        md = meetings.build_markdown(self.out_dir, messages, people, **options)
+        if self.export_dialog is not None:
+            self.export_dialog.close()
+        target = pathlib.Path(target)
+
+        def finished(error):
+            if error:
+                self.toast(f"Export failed: {error}")
+            else:
+                self.toast(f"Exported to {target.name}", "Open", lambda: subprocess.Popen(["xdg-open", str(target)]))
+            if on_done:
+                on_done(error)
+            return False
+
+        if target.suffix.lower() == ".md":
+            try:
+                target.write_text(md, encoding="utf-8")
+                finished(None)
+            except OSError as e:
+                finished(str(e))
+            return
+
+        def work():
+            with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+                f.write(md)
+            r = subprocess.run([str(APP_DIR / "venv/bin/python"), str(APP_DIR / "export.py"), f.name, str(target)],
+                               capture_output=True, text=True)
+            os.unlink(f.name)
+            GLib.idle_add(finished, None if r.returncode == 0 else (r.stderr.strip().splitlines() or ["unknown"])[-1])
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- transcribe again -----------------------------------------------------
+    def open_retranscribe_dialog(self):
+        if self.out_dir is None or self.proc is not None:
+            return
+        minutes = max(1, round(meetings.duration(self.out_dir) / 60))
+        dialog = Adw.Dialog(title="Transcribe again", content_width=480)
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+        dialog.set_child(view)
+        group = Adw.PreferencesGroup(
+            title="Engine",
+            description="Makes a fresh transcript from this meeting's saved audio. Your current transcript is kept "
+                        "as a backup file in the meeting folder. Speakers are detected again, and voices you have "
+                        "named before are recognised automatically.")
+        checks = []
+        for name, _engine, _model, _info, factor in ENGINES:
+            check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            if checks:
+                check.set_group(checks[0])
+            est = max(1, round(minutes * factor))
+            row = Adw.ActionRow(title=name, subtitle=f"About {est} minute{'s' if est > 1 else ''} for this "
+                                                     f"{minutes}-minute meeting.", activatable_widget=check)
+            row.add_prefix(check)
+            group.add(row)
+            checks.append(check)
+        checks[2].set_active(True)
+        lang = Adw.ComboRow(title="Meeting language (Whisper only)", model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
+        lang.set_factory(self.plain_factory())
+        lang.set_list_factory(self.plain_factory())
+        lang.set_selected(self.lang_row.get_selected())
+        group.add(lang)
+        go = Gtk.Button(label="Start", halign=Gtk.Align.CENTER, margin_top=12)
+        go.add_css_class("suggested-action")
+        go.add_css_class("pill")
+        go.connect("clicked", lambda _b: (dialog.close(), self.start_retranscribe(
+            next(i for i, c in enumerate(checks) if c.get_active()), LANGUAGES[lang.get_selected()][1])))
+        group.add(go)
+        page.add(group)
+        self.retx_dialog = dialog
+        dialog.present(self)
+
+    def start_retranscribe(self, engine_index, language):
+        if self.out_dir is None or self.proc is not None:
+            return
+        cmd = self.worker_cmd()
+        if cmd is None:
+            return
+        self.flush_transcript_save()
+        self.stop_playback()
+        _, engine, model = ENGINES[engine_index][:3]
+        cmd += ["--retranscribe", str(self.out_dir), "--engine", engine]
+        if engine == "whisper":
+            cmd += ["--model", model, "--language", language]
+        self.retranscribing = True
+        self.last_error = None
+        self.deferred = False
+        self.loading_transcript = True
+        self.t_buf.set_text("")
+        self.loading_transcript = False
+        if not self.launch(cmd):
+            self.retranscribing = False
+            return
+        self.set_state("finishing", f"Using {ENGINES[engine_index][0]}. You can keep using your computer.")
+        self.progress.set_fraction(0)
+        self.progress.set_text("Starting…")
+
+    # --- preferences -------------------------------------------------------
+    def open_preferences(self):
+        p = prefs()
+        dialog = Adw.PreferencesDialog(title="Preferences")
+        page = Adw.PreferencesPage(title="General", icon_name="emblem-system-symbolic")
+        bg = Adw.PreferencesGroup(title="Running in the background")
+        rows = {
+            "background": Adw.SwitchRow(
+                title="Keep running when the window is closed", active=p["background"],
+                subtitle="MeetScribe stays in the top bar (tray icon), keeps any recording going and can notice "
+                         "when a call starts."),
+            "autostart": Adw.SwitchRow(title="Start when you log in", active=p["autostart"],
+                                       subtitle="Opens quietly in the tray, ready for your first call."),
+            "detect_calls": Adw.SwitchRow(
+                title="Ask to record when a call starts", active=p["detect_calls"],
+                subtitle="When Zoom, Lark, Teams or a browser starts using your microphone, MeetScribe offers to "
+                         "record, and offers to stop when the call ends."),
+            "speakers": Adw.SwitchRow(
+                title="Tell speakers apart", active=p["speakers"],
+                subtitle="Labels other people as Speaker 1, Speaker 2… and recognises voices you have named "
+                         "before. Uses a little extra CPU."),
+        }
+        bg.add(rows["background"])
+        bg.add(rows["autostart"])
+        meet = Adw.PreferencesGroup(title="Meetings")
+        meet.add(rows["detect_calls"])
+        meet.add(rows["speakers"])
+        page.add(bg)
+        page.add(meet)
+        dialog.add(page)
+
+        def changed(row, _param, key):
+            new = prefs()
+            new[key] = row.get_active()
+            save_settings({"prefs": new})
+            if key == "autostart":
+                set_autostart(new["autostart"])
+            if self.hooks:
+                self.hooks.apply_prefs()
+        for key, row in rows.items():
+            row.connect("notify::active", changed, key)
+        self.prefs_dialog = dialog
+        self.prefs_rows = rows
+        dialog.present(self)
+
+    # --- folders ---------------------------------------------------
+    def on_open_folder(self, _btn):
+        if self.out_dir and self.out_dir.exists():
+            subprocess.Popen(["xdg-open", str(self.out_dir)])
+
+    def load_folder(self, folder):
+        """Show an earlier meeting's transcript, chat and bookmarks."""
+        folder = pathlib.Path(folder)
+        if chat.transcript_path(folder) is None:
+            self.toast("That folder has no transcript.")
+            return False
+        if self.chat is not None and self.chat.busy:
+            self.chat.cancel()
+        self.stop_playback()
+        self.out_dir = folder
+        self.show_transcript_file(folder)
+        self.chat = chat.Chat(folder)
+        self.render_chat()
+        self.bookmarks = meetings.load_bookmarks(folder)
+        self.render_bookmarks()
+        self.stack.set_visible_child_name("transcript")
+        self.set_state("done", f"Opened “{meetings.title(folder)}”. Use “Ask Agent” to summarize it or ask "
+                               "questions.")
+        self.update_title()
+        self.refresh_sidebar()
+        return True
+
+    # --- closing ---------------------------------------------------
+    def on_close_request(self, _win):
+        self.flush_transcript_save()
+        if self.hooks and self.hooks.runs_in_background():
+            self.set_visible(False)         # keep running in the tray
+            if self.proc is not None:
+                self.hooks.notify("MeetScribe is still recording",
+                                  "Use the MeetScribe icon in the top bar to stop or reopen the window.")
+            return True
+        if self.chat is not None and self.chat.busy:
+            self.chat.cancel()
+        self.stop_playback()
+        if self.proc is None or self.quit_after_stop:
+            return False
+        dialog = Adw.AlertDialog(
+            heading="Recording in progress",
+            body="Closing now stops the recording. What has been said so far will still be transcribed and saved.")
+        dialog.add_response("keep", "Keep recording")
+        dialog.add_response("stop", "Stop and close")
+        dialog.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("keep")
+        dialog.set_close_response("keep")
+        dialog.connect("response", self.on_quit_response)
+        self.quit_dialog = dialog
+        dialog.present(self)
+        return True
+
+    def on_quit_response(self, _dialog, response):
+        if response == "stop" and self.proc is not None:
+            self.quit_after_stop = True
+            self.stop()
+
+
+class App(Adw.Application):
+    """Owns the window, the tray icon, call detection and notifications."""
+
+    def __init__(self, background=False, app_id=APP_ID):
+        super().__init__(application_id=app_id)
+        self.win = None
+        self.tray = None
+        self.watch = None
+        self.held = False
+        self.start_hidden = background
+        self.call_app = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        for name, handler in (("show", self.show_window), ("start-recording", self.start_recording),
+                              ("stop-recording", self.stop_recording), ("bookmark", lambda: self.win.add_bookmark()),
+                              ("preferences", lambda: (self.show_window(), self.win.open_preferences())),
+                              ("quit", self.quit_all)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _a, _p, h=handler: h())
+            self.add_action(action)
+        self.set_accels_for_action("app.bookmark", ["<Control>b"])
+        self.set_accels_for_action("app.preferences", ["<Control>comma"])
+        self.set_accels_for_action("app.quit", ["<Control>q"])
+
+    def do_activate(self):
+        if self.win is None:
+            self.win = Window(self, hooks=self)
+            self.apply_prefs()
+            if self.start_hidden and self.runs_in_background():
+                return
+        self.show_window()
+
+    # --- hooks used by the window ------------------------------------------------
+    def runs_in_background(self):
+        return prefs()["background"] and self.tray is not None and self.tray.ok
+
+    def apply_prefs(self):
+        p = prefs()
+        if p["background"] and self.tray is None:
+            self.tray = tray.Tray(self.show_window, self.tray_items)
+        if p["background"] and not self.held:
+            self.hold()
+            self.held = True
+        elif not p["background"] and self.held:
+            self.release()
+            self.held = False
+        if p["detect_calls"] and self.watch is None:
+            self.watch = callwatch.CallWatch(self.on_call_start, self.on_call_end)
+        if self.watch is not None:
+            self.watch.enabled = p["detect_calls"]
+
+    def state_changed(self):
+        if self.tray is not None:
+            self.tray.update(self.recording())
+
+    def recording(self):
+        w = self.win
+        return w is not None and w.proc is not None and not w.retranscribing and w.state in RECORDING_STATES
+
+    def notify(self, title, body, buttons=()):
+        n = Gio.Notification.new(title)
+        n.set_body(body)
+        n.set_default_action("app.show")
+        for label, action in buttons:
+            n.add_button(label, action)
+        self.send_notification("meetscribe", n)
+
+    def quit_now(self):
+        if self.held:
+            self.release()
+            self.held = False
+        self.quit()
+
+    # --- tray menu and actions --------------------------------------------------
+    def tray_items(self):
+        w = self.win
+        rec = self.recording()
+        can_toggle = w is not None and not w.retranscribing and w.state != "finishing"
+        return [("Open MeetScribe", True, self.show_window), None,
+                ("Stop recording" if rec else "Start recording", can_toggle,
+                 self.stop_recording if rec else self.start_recording),
+                ("Bookmark this moment", rec and w.state == "recording", lambda: w.add_bookmark()), None,
+                ("Quit MeetScribe", True, self.quit_all)]
+
+    def show_window(self):
+        if self.win is not None:
+            self.win.set_visible(True)
+            self.win.present()
+
+    def start_recording(self):
+        if self.win is not None and self.win.proc is None:
+            self.show_window()
+            self.win.start()
+
+    def stop_recording(self):
+        if self.recording():
+            self.win.stop()
+
+    def quit_all(self):
+        if self.win is not None and self.win.proc is not None and not self.win.retranscribing:
+            self.win.quit_after_stop = True     # finish and save the transcript first
+            self.win.stop()
+            self.notify("Saving your meeting", "MeetScribe will close once the transcript is saved.")
+            return
+        self.quit_now()
+
+    # --- call detection --------------------------------------------------------
+    def on_call_start(self, app_name):
+        self.call_app = app_name
+        if self.win is None or self.win.proc is not None:
+            return
+        self.notify(f"{app_name} is using your microphone", "Looks like a call. Record and transcribe it?",
+                    [("Start recording", "app.start-recording")])
+        if self.win.is_visible():
+            self.win.toast(f"{app_name} started using your microphone.", "Record", self.start_recording)
+
+    def on_call_end(self, app_name):
+        if self.recording():
+            self.notify(f"Your {app_name} call seems to have ended",
+                        "Stop recording and save the transcript?", [("Stop recording", "app.stop-recording")])
+            if self.win.is_visible():
+                self.win.toast(f"{app_name} released your microphone.", "Stop recording", self.stop_recording)
+
+
+def main():
+    os.chdir(pathlib.Path.home())
+    background = "--background" in sys.argv
+    App(background=background).run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    main()
