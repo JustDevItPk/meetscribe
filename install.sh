@@ -29,7 +29,7 @@ export UV_PYTHON_INSTALL_DIR="$dest/python"
 [ -x "$dest/venv/bin/python" ] || "$dest/uv/uv" venv --python 3.12 "$dest/venv"
 "$dest/uv/uv" pip install --python "$dest/venv/bin/python" faster-whisper sherpa-onnx python-docx fpdf2
 
-cp "$here"/{worker,gui,chat,speakers,voices,meetings,procstats,tray,callwatch,export,summarize}.py "$here/meetscribe" "$dest/"
+cp "$here"/{worker,gui,chat,speakers,voices,voicereview,meetings,procstats,tray,callwatch,export,summarize}.py "$here/meetscribe" "$dest/"
 "$dest/venv/bin/python" "$dest/worker.py" --prepare
 chmod +x "$dest/meetscribe"
 ln -sf "$dest/meetscribe" "$HOME/.local/bin/meetscribe"

@@ -26,6 +26,7 @@ import meetings  # noqa: E402
 import procstats  # noqa: E402
 import speakers  # noqa: E402
 import tray  # noqa: E402
+import voicereview  # noqa: E402
 import voices  # noqa: E402
 
 APP_ID = "dev.meetscribe.app"
@@ -276,10 +277,14 @@ class Window(Adw.ApplicationWindow):
         header.pack_start(self.speakers_btn)
 
         menu = Gio.Menu()
+        menu.append("Learned voices…", "win.voices")
         menu.append("Preferences", "app.preferences")
         menu.append("Quit MeetScribe", "app.quit")
         self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
-        self.menu_btn.set_tooltip_text("Preferences and quit")
+        self.menu_btn.set_tooltip_text("Learned voices, preferences and quit")
+        voices_action = Gio.SimpleAction.new("voices", None)
+        voices_action.connect("activate", lambda _a, _p: self.open_voice_review())
+        self.add_action(voices_action)
         header.pack_end(self.menu_btn)
         self.folder_btn = Gtk.Button(icon_name="folder-symbolic")
         self.folder_btn.set_tooltip_text("Open this meeting's folder (transcript, audio recordings, chat)")
@@ -1817,8 +1822,17 @@ class Window(Adw.ApplicationWindow):
     def open_speakers_dialog(self):
         if self.speaker_popover is not None:
             self.speaker_popover.popdown()
-        self.speakers_dialog = speakers.SpeakersDialog(on_changed=lambda: None)
+        self.speakers_dialog = speakers.SpeakersDialog(on_changed=lambda: None, on_review=self.open_voice_review)
         self.speakers_dialog.present(self)
+
+    def open_voice_review(self, name=None):
+        """Review the clips each learned voice was built from (and remove the wrong ones)."""
+        dialog = voicereview.VoiceReviewDialog(
+            MEETINGS_DIR, play=lambda path, start, dur, label: self.play(path, start, dur, label),
+            stop=self.stop_playback, is_playing=lambda: self.player is not None and self.player.poll() is None,
+            focus=name)
+        dialog.connect("closed", lambda _d: getattr(self, "speakers_dialog", None) and self.speakers_dialog.refresh())
+        dialog.present(self)
 
     @staticmethod
     def line_key(stamp, text):
@@ -2126,21 +2140,28 @@ class Window(Adw.ApplicationWindow):
         who = "you" if name == "You" else name
         count = f"{len(targets)} line{'s' if len(targets) > 1 else ''}"
         msg = f"Bulk assigned {count} to {who}" if bulk else f"{count} assigned to {who}"
+        voices.migrate(MEETINGS_DIR)        # no-op once the clip list exists
         if name not in ("You", "Them") and samples:
-            voices.learn(name, samples)
+            voices.learn(name, samples)     # also takes these moments out of anyone they were learned for
             msg += f". Voice learned, so {name} will be recognised in future meetings"
+        elif samples:
+            voices.unlearn(samples)
         self.toast(msg)
 
     def voice_samples(self, stamp, text):
-        """(voiceprint, seconds) of the recorded segment behind a transcript line, if any."""
+        """The recorded segment behind a transcript line as a voice clip (see voices.clip), if any."""
         t = secs(stamp)
         for g in self.segments:
             if int(g["start"]) == t and g.get("emb") and g["text"].strip()[:40] == text.strip()[:40]:
-                return [(g["emb"], g["end"] - g["start"])]
+                if self.out_dir is None:
+                    return [(g["emb"], g["end"] - g["start"])]
+                return [voices.clip(self.out_dir.name, g.get("stream", "Them"), g["start"], g["end"], g["text"], g["emb"])]
         return []
 
     def learn_from_map(self):
-        """After a meeting, learn the voices of people you named during it."""
+        """After a meeting, learn the voices of people you named during it (clips already learned while
+        naming them are recognised as the same and not counted twice)."""
+        voices.migrate(MEETINGS_DIR)
         by_name = {}
         for key, name in self.speaker_map.items():
             if name in ("You", "Them") or "|" not in key:

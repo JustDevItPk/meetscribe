@@ -49,9 +49,10 @@ def validate(name, email, speakers):
 class SpeakersDialog(Adw.Dialog):
     """Add or remove the people who usually join your meetings."""
 
-    def __init__(self, on_changed):
+    def __init__(self, on_changed, on_review=None):
         super().__init__(title="Speakers", content_width=480, content_height=560)
         self.on_changed = on_changed
+        self.on_review = on_review
         self.speakers = load()
 
         view = Adw.ToolbarView()
@@ -86,6 +87,14 @@ class SpeakersDialog(Adw.Dialog):
         page.add(add_group)
 
         self.list_group = Adw.PreferencesGroup(title="Your speakers")
+        if on_review is not None:
+            review = Gtk.Button(child=Adw.ButtonContent(icon_name="audio-volume-high-symbolic", label="Review voices…"),
+                                valign=Gtk.Align.CENTER)
+            review.add_css_class("flat")
+            review.set_tooltip_text("Listen to the clips each voice was learned from and remove the wrong ones, "
+                                    "so people are recognised more accurately")
+            review.connect("clicked", lambda _b: self.on_review(None))
+            self.list_group.set_header_suffix(review)
         page.add(self.list_group)
         self.rows = []
         self.refresh()
@@ -104,13 +113,20 @@ class SpeakersDialog(Adw.Dialog):
             heard = learned.get(s["name"])
             voice = (f"Voice learned from {round(heard['seconds'] / 60, 1)} min of speech" if heard else
                      "Voice not learned yet: pick them for a line in a transcript")
-            row = Adw.ActionRow(title=s["name"], subtitle=f"{s.get('email') or 'No email'}\n{voice}")
+            row = Adw.ActionRow(title=s["name"], subtitle=f"{s.get('email') or 'No email'}\n{voice}", use_markup=False)
             row.add_prefix(Gtk.Image(icon_name="avatar-default-symbolic"))
             remove = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
             remove.add_css_class("flat")
             remove.set_tooltip_text(f"Remove {s['name']} from the list (transcripts keep the name)")
             remove.update_property([Gtk.AccessibleProperty.LABEL], [f"Remove {s['name']}"])
             remove.connect("clicked", lambda _b, name=s["name"]: self.on_remove(name))
+            if heard and self.on_review is not None:
+                clips = Gtk.Button(icon_name="audio-volume-high-symbolic", valign=Gtk.Align.CENTER)
+                clips.add_css_class("flat")
+                clips.set_tooltip_text(f"Review the clips {s['name']}'s voice was learned from")
+                clips.update_property([Gtk.AccessibleProperty.LABEL], [f"Review {s['name']}'s voice"])
+                clips.connect("clicked", lambda _b, name=s["name"]: self.on_review(name))
+                row.add_suffix(clips)
             if heard:
                 forget = Gtk.Button(icon_name="edit-clear-symbolic", valign=Gtk.Align.CENTER)
                 forget.add_css_class("flat")
