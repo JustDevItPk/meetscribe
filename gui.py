@@ -190,6 +190,9 @@ class Window(Adw.ApplicationWindow):
         self.speaker_map = {}       # "HH:MM:SS|text start" -> assigned name, for the current meeting
         self.live_names = {}        # "Speaker 2" -> "Awan" while recording, so new lines follow your choice
         self.speaker_popover = None
+        self.bulk_marks = []          # TextMarks at the start of Ctrl-clicked transcript lines
+        self.bulk_anchor = None       # last Ctrl-clicked line, for Shift+click ranges
+        self.bulk_popover = None
         self.segments = []
         self.bookmarks = []
         self.bm_rows = []
@@ -514,11 +517,19 @@ class Window(Adw.ApplicationWindow):
         self.t_buf.create_tag("you", foreground="#26a269", weight=Pango.Weight.BOLD)
         self.t_buf.create_tag("speaker-link", underline=Pango.Underline.SINGLE)
         self.t_buf.create_tag("flash", background="#f6d32d")
+        self.t_buf.create_tag("bulk", background="rgba(53,132,228,0.18)")
         self.t_view = Gtk.TextView(buffer=self.t_buf, editable=False, cursor_visible=False,
                                    wrap_mode=Gtk.WrapMode.WORD_CHAR, pixels_below_lines=4)
         for side in ("top", "bottom", "left", "right"):
             getattr(self.t_view, f"set_{side}_margin")(10)
         self.t_buf.connect("changed", self.on_transcript_edited)
+        self.t_buf.connect("notify::has-selection", self.update_bulk)
+        self.t_buf.connect("mark-set", lambda _b, _it, mk: mk.get_name() in ("insert", "selection_bound") and
+                           self.t_buf.get_has_selection() and self.update_bulk())
+        esc = Gtk.EventControllerKey()
+        esc.connect("key-pressed", lambda _c, key, _code, _mods: key == Gdk.KEY_Escape and bool(self.bulk_marks)
+                    and (self.clear_bulk(selection=False) or True))
+        self.t_view.add_controller(esc)
         # Decide on press (capture phase, so the text view's own selection drag never starts), act on
         # release (a popover opened while the button is still held is dismissed by that release). A drag
         # gesture rather than a click one, because a click is cancelled by a pixel of movement (touchpads)
@@ -572,6 +583,25 @@ class Window(Adw.ApplicationWindow):
         bar.append(use)
         self.version_bar.set_child(bar)
         t_page.append(self.version_bar)
+        self.bulk_bar = Gtk.Revealer(reveal_child=False)
+        bulk = Gtk.Box(spacing=10)
+        bulk.add_css_class("card")
+        bulk.add_css_class("version-bar")
+        bulk.append(Gtk.Image(icon_name="system-users-symbolic", valign=Gtk.Align.CENTER))
+        self.bulk_label = Gtk.Label(xalign=0, wrap=True, hexpand=True)
+        bulk.append(self.bulk_label)
+        clear = Gtk.Button(label="Clear", valign=Gtk.Align.CENTER)
+        clear.set_tooltip_text("Unselect these chunks (Esc)")
+        clear.connect("clicked", lambda _b: self.clear_bulk())
+        self.bulk_popover = Gtk.Popover()
+        assign = Gtk.MenuButton(label="Bulk assign speaker…", valign=Gtk.Align.CENTER, popover=self.bulk_popover)
+        assign.add_css_class("suggested-action")
+        assign.set_tooltip_text("Choose one speaker for every selected chunk")
+        assign.set_create_popup_func(self.fill_bulk_popover)
+        bulk.append(clear)
+        bulk.append(assign)
+        self.bulk_bar.set_child(bulk)
+        t_page.append(self.bulk_bar)
         t_page.append(hint_row)
         t_page.append(self.play_box)
         t_page.append(self.t_stack)
@@ -733,10 +763,11 @@ class Window(Adw.ApplicationWindow):
         self.save_status.set_visible(editable)
         self.edit_hint.set_text(
             "Earlier transcript (read-only). Click a time to hear that moment." if self.viewing is not None else
-            "Click a time to hear that moment. Click a speaker name to choose who said it. Click anywhere else to "
-            "fix mistakes; changes save automatically (Ctrl+Z undoes)." if editable else
-            "Click a time to hear that moment, or a speaker name to choose who is speaking. Text editing opens "
-            "once the recording has finished.")
+            "Click a time to hear that moment. Click a speaker name to choose who said it; Ctrl+click several "
+            "names (or select across lines) to bulk assign a speaker. Click anywhere else to fix mistakes; "
+            "changes save automatically (Ctrl+Z undoes)." if editable else
+            "Click a time to hear that moment, or a speaker name to choose who is speaking; Ctrl+click several "
+            "names to bulk assign a speaker. Text editing opens once the recording has finished.")
         self.folder_btn.set_sensitive(have_meeting)
         self.export_btn.set_sensitive(have_meeting and has_text and not busy)
         has_audio = have_meeting and any((self.out_dir / n).exists() for n in ("audio-meeting.ogg", "audio-mic.ogg"))
@@ -818,6 +849,7 @@ class Window(Adw.ApplicationWindow):
         self.render_bookmarks()
         self.clear_chat_view()
         self.loading_transcript = True
+        self.clear_bulk()
         self.t_buf.set_text("")
         self.loading_transcript = False
         self.peaks = {"them": 0.0, "you": 0.0}
@@ -1114,6 +1146,7 @@ class Window(Adw.ApplicationWindow):
         self.render_bookmarks()
         self.clear_chat_view()
         self.loading_transcript = True
+        self.clear_bulk()
         self.t_buf.set_text("")
         self.loading_transcript = False
         self.stack.set_visible_child_name("transcript")
@@ -1164,6 +1197,7 @@ class Window(Adw.ApplicationWindow):
         self.leave_version()
         path = chat.transcript_path(folder)
         self.loading_transcript = True
+        self.clear_bulk()
         self.t_buf.set_text("")
         self.loading_transcript = False
         self.speaker_map = self.load_speaker_map(folder)
@@ -1305,6 +1339,7 @@ class Window(Adw.ApplicationWindow):
             self.viewing = version
             self.segments = self.load_segments(version["path"].parent) if version["segments"] else []
             self.loading_transcript = True
+            self.clear_bulk()
             self.t_buf.set_text("")
             self.loading_transcript = False
             for line in lines:
@@ -1490,6 +1525,7 @@ class Window(Adw.ApplicationWindow):
             for tag in (self.speaker_tag(m.group(2)), "speaker-link"):
                 buf.apply_tag_by_name(tag, buf.get_iter_at_offset(who_start),
                                       buf.get_iter_at_offset(who_start + len(m.group(2))))
+        self.update_bulk()
 
     @staticmethod
     def speaker_tag(name):
@@ -1845,6 +1881,13 @@ class Window(Adw.ApplicationWindow):
             gesture.set_state(Gtk.EventSequenceState.DENIED)    # a press inside the popover, not on the text
             return
         hit = self.transcript_hit(x, y)
+        mods = gesture.get_current_event_state()
+        if hit and mods & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK):
+            # Ctrl+click toggles a chunk for bulk assign, Shift+click adds the range from the last one
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self.transcript_press = None
+            self.toggle_bulk(hit[1], extend=bool(mods & Gdk.ModifierType.SHIFT_MASK))
+            return
         self.transcript_press = (hit, x, y) if hit else None
         # claim speaker names / timestamps so pressing them never starts a text selection;
         # leave ordinary text to the text view for normal selecting and editing
@@ -1868,22 +1911,110 @@ class Window(Adw.ApplicationWindow):
             return
         rect = Gdk.Rectangle()
         rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
-        self.show_speaker_popover(line, m.group(2), rect)
-
-    def show_speaker_popover(self, line, current, rect):
+        selected = self.bulk_lines()
+        if line in selected and len(selected) > 1:
+            lines = selected        # a name inside the selection: assign the whole selection
+        else:
+            lines = [line]
         if self.speaker_popover is None:
             self.speaker_popover = Gtk.Popover(has_arrow=True)
             self.speaker_popover.set_parent(self.t_view)
+        search = self.fill_speaker_menu(self.speaker_popover, lines)
+        self.speaker_popover.set_pointing_to(rect)
+        self.speaker_popover.popup()
+        if search is not None:
+            search.grab_focus()
+
+    # --- bulk assign speaker ----------------------------------------------
+    def bulk_lines(self):
+        """Transcript lines chosen for bulk assign: Ctrl/Shift-clicked chunks plus every speaker line a
+        text selection spans (when it spans more than one)."""
+        lines = {self.t_buf.get_iter_at_mark(mk).get_line() for mk in self.bulk_marks}
+        bounds = self.t_buf.get_selection_bounds()
+        if bounds:
+            a, b = bounds
+            last = b.get_line() - (1 if b.starts_line() and b.get_line() > a.get_line() else 0)
+            spanned = [n for n in range(a.get_line(), last + 1) if self.line_info(n) is not None]
+            if len(spanned) > 1:
+                lines.update(spanned)
+        return sorted(n for n in lines if self.line_info(n) is not None)
+
+    def toggle_bulk(self, line, extend=False):
+        if self.viewing is not None:
+            self.toast("This earlier transcript is read-only. Press “Use this version” to change its speakers.")
+            return
+        marked = {self.t_buf.get_iter_at_mark(mk).get_line(): mk for mk in self.bulk_marks}
+        if extend and self.bulk_anchor is not None:
+            lo, hi = sorted((self.bulk_anchor, line))
+            for n in range(lo, hi + 1):
+                if n not in marked and self.line_info(n) is not None:
+                    self.bulk_marks.append(self.t_buf.create_mark(None, self.t_buf.get_iter_at_line(n)[1], True))
+        elif line in marked:
+            self.t_buf.delete_mark(marked[line])
+            self.bulk_marks.remove(marked[line])
+        else:
+            self.bulk_marks.append(self.t_buf.create_mark(None, self.t_buf.get_iter_at_line(line)[1], True))
+        self.bulk_anchor = line
+        self.update_bulk()
+
+    def clear_bulk(self, selection=True):
+        for mk in self.bulk_marks:
+            if not mk.get_deleted():
+                self.t_buf.delete_mark(mk)
+        self.bulk_marks = []
+        self.bulk_anchor = None
+        if selection and self.t_buf.get_has_selection():
+            self.t_buf.place_cursor(self.t_buf.get_iter_at_mark(self.t_buf.get_insert()))
+        self.update_bulk()
+
+    def update_bulk(self, *_args):
+        """Highlight the Ctrl-clicked chunks and show the bulk assign bar while two or more are chosen
+        (or one Ctrl-clicked chunk, so it's clear what Ctrl+click did)."""
+        if not hasattr(self, "bulk_bar"):
+            return      # still building the window
+        buf = self.t_buf
+        buf.remove_tag_by_name("bulk", buf.get_start_iter(), buf.get_end_iter())
+        for mk in self.bulk_marks:
+            info = self.line_info(buf.get_iter_at_mark(mk).get_line())
+            if info is not None:
+                buf.apply_tag_by_name("bulk", info[0], info[1])
+        n = len(self.bulk_lines())
+        show = n > 1 or (n == 1 and bool(self.bulk_marks))
+        self.bulk_bar.set_reveal_child(show)
+        if show:
+            self.bulk_label.set_text(f"{n} chunk{'s' if n != 1 else ''} selected. "
+                                     "Ctrl+click names to add or remove, Shift+click for a range.")
+        if self.bulk_popover is not None and self.bulk_popover.get_visible() and not show:
+            self.bulk_popover.popdown()
+
+    def fill_bulk_popover(self, _button):
+        lines = self.bulk_lines()
+        if lines:
+            search = self.fill_speaker_menu(self.bulk_popover, lines)
+            if search is not None:
+                GLib.idle_add(lambda: search.grab_focus() and False)
+
+    def fill_speaker_menu(self, popover, lines):
+        """Put the "who is speaking?" list into `popover` for transcript `lines` (one line, or several
+        for bulk assign). Returns its search entry, if any, for focusing."""
+        names = {self.line_info(n)[2].group(2) for n in lines}
+        current = next(iter(names)) if len(names) == 1 else None
+        bulk = len(lines) > 1
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         for side in ("top", "bottom", "start", "end"):
             getattr(box, f"set_margin_{side}")(6)
-        title = Gtk.Label(label="Who is speaking?", xalign=0)
+        title = Gtk.Label(label=f"Bulk assign speaker · {len(lines)} chunks" if bulk else "Who is speaking?",
+                          xalign=0)
         title.add_css_class("heading")
         box.append(title)
-        group = bool(SPEAKER_N_RE.match(current))
+        group = not bulk and bool(SPEAKER_N_RE.match(current))
         follow = Gtk.CheckButton(
             label=f"All lines from {current}" if group else "Also the following “Them” lines\n(until someone else speaks)",
             active=group)
+
+        def pick(name):
+            popover.popdown()
+            self.assign_speaker(lines, name, follow.get_active() and not bulk)
         people = speakers.load()
         if not people:
             note = Gtk.Label(label="No speakers yet.", xalign=0)
@@ -1903,7 +2034,7 @@ class Window(Adw.ApplicationWindow):
             tip = [person.get("email") or "", "Voice learned" if person["name"] in learned else ""]
             if any(tip):
                 b.set_tooltip_text(" · ".join(t for t in tip if t))
-            b.connect("clicked", lambda _b, name=person["name"]: self.assign_speaker(line, name, follow.get_active()))
+            b.connect("clicked", lambda _b, name=person["name"]: pick(name))
             people_box.append(b)
             buttons.append((f"{person['name']} {person.get('email') or ''}".lower(), b))
         search = None
@@ -1921,7 +2052,7 @@ class Window(Adw.ApplicationWindow):
                     first.emit("clicked")
             search.connect("search-changed", filter_people)
             search.connect("activate", pick_first)
-            search.connect("stop-search", lambda _e: self.speaker_popover.popdown())     # Escape
+            search.connect("stop-search", lambda _e: popover.popdown())     # Escape
             box.append(search)
         if people:
             box.append(Gtk.ScrolledWindow(child=people_box, hscrollbar_policy=Gtk.PolicyType.NEVER,
@@ -1932,41 +2063,47 @@ class Window(Adw.ApplicationWindow):
             b = Gtk.Button(label=caption + ("  ✓" if name == current else ""))
             b.add_css_class("flat")
             b.get_child().set_xalign(0)
-            b.connect("clicked", lambda _b, n=name: self.assign_speaker(line, n, follow.get_active()))
+            b.connect("clicked", lambda _b, n=name: pick(n))
             box.append(b)
-        if people or group:
+        if not bulk and (people or group):
             box.append(follow)
         manage = Gtk.Button(child=self.icon_label("system-users-symbolic", "Add or remove speakers…"))
         manage.add_css_class("flat")
-        manage.connect("clicked", lambda _b: self.open_speakers_dialog())
+        manage.connect("clicked", lambda _b: (popover.popdown(), self.open_speakers_dialog()))
         box.append(manage)
-        self.speaker_popover.set_child(box)
-        self.speaker_popover.set_pointing_to(rect)
-        self.speaker_popover.popup()
-        if search is not None:
-            search.grab_focus()
+        popover.set_child(box)
+        return search
 
-    def assign_speaker(self, line, name, follow=False):
-        """Give transcript line `line` to `name`; with `follow`, also every line of that detected speaker
-        (for "Speaker N") or the following unnamed "Them" lines."""
-        if self.speaker_popover is not None:
-            self.speaker_popover.popdown()
-        info = self.line_info(line)
-        if info is None:
+    def assign_speaker(self, lines, name, follow=False):
+        """Give transcript `lines` (a line number or a list, for bulk assign) to `name`; with `follow` and
+        one line, also every line of that detected speaker (for "Speaker N") or the following unnamed
+        "Them" lines."""
+        for pop in (self.speaker_popover, self.bulk_popover):
+            if pop is not None:
+                pop.popdown()
+        targets = [lines] if isinstance(lines, int) else list(lines)
+        bulk = len(targets) > 1
+        targets = [n for n in targets if self.line_info(n) is not None]
+        if not targets:
             return
-        current = info[2].group(2)
-        targets = [line]
-        if follow and SPEAKER_N_RE.match(current):
-            targets = [n for n in range(self.t_buf.get_line_count())
-                       if (i := self.line_info(n)) is not None and i[2].group(2) == current]
-            if self.proc is not None and not self.retranscribing:
-                self.live_names[current] = name     # later lines from this voice follow your choice
-        elif follow:
-            n = line + 1
-            while (i := self.line_info(n)) is not None and i[2].group(2) == "Them":
-                targets.append(n)
-                n += 1
+        if follow and len(targets) == 1:
+            line = targets[0]
+            current = self.line_info(line)[2].group(2)
+            if SPEAKER_N_RE.match(current):
+                targets = [n for n in range(self.t_buf.get_line_count())
+                           if (i := self.line_info(n)) is not None and i[2].group(2) == current]
+                if self.proc is not None and not self.retranscribing:
+                    self.live_names[current] = name     # later lines from this voice follow your choice
+            else:
+                n = line + 1
+                while (i := self.line_info(n)) is not None and i[2].group(2) == "Them":
+                    targets.append(n)
+                    n += 1
         samples = []
+        # Ctrl+Z returns the cursor to where it was when this started, and scrolls there: put it on the
+        # first changed line, or undo would jump to wherever it was left (often the end of the transcript).
+        self.t_buf.place_cursor(self.t_buf.get_iter_at_line(min(targets))[1])
+        self.t_buf.begin_user_action()      # one Ctrl+Z undoes the whole assignment
         for n in targets:
             i = self.line_info(n)
             if i is None:
@@ -1975,18 +2112,20 @@ class Window(Adw.ApplicationWindow):
             who_start = start.get_offset() + len(m.group(1)) + 2
             a = self.t_buf.get_iter_at_offset(who_start)
             b = self.t_buf.get_iter_at_offset(who_start + len(m.group(2)))
-            self.t_buf.begin_user_action()
             self.t_buf.delete(a, b)
             self.t_buf.insert_with_tags_by_name(self.t_buf.get_iter_at_offset(who_start), name,
                                                 self.speaker_tag(name), "speaker-link")
-            self.t_buf.end_user_action()
             self.speaker_map[self.line_key(m.group(1), m.group(3))] = name
             samples += self.voice_samples(m.group(1), m.group(3))
+        self.t_buf.end_user_action()
+        if bulk:
+            self.clear_bulk()
         self.save_speaker_map()
         if self.t_view.get_editable():
             self.flush_transcript_save()     # write it now rather than after the usual pause
         who = "you" if name == "You" else name
-        msg = f"{len(targets)} line{'s' if len(targets) > 1 else ''} assigned to {who}"
+        count = f"{len(targets)} line{'s' if len(targets) > 1 else ''}"
+        msg = f"Bulk assigned {count} to {who}" if bulk else f"{count} assigned to {who}"
         if name not in ("You", "Them") and samples:
             voices.learn(name, samples)
             msg += f". Voice learned, so {name} will be recognised in future meetings"
@@ -2192,6 +2331,7 @@ class Window(Adw.ApplicationWindow):
         self.last_error = None
         self.deferred = False
         self.loading_transcript = True
+        self.clear_bulk()
         self.t_buf.set_text("")
         self.loading_transcript = False
         if not self.launch(cmd):
