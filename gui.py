@@ -22,9 +22,11 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 import callwatch  # noqa: E402
 import chat  # noqa: E402
+import datasize  # noqa: E402
 import meetings  # noqa: E402
 import procstats  # noqa: E402
 import speakers  # noqa: E402
+import storage  # noqa: E402
 import tray  # noqa: E402
 import voicereview  # noqa: E402
 import voices  # noqa: E402
@@ -97,6 +99,7 @@ CSS = """
 .composer textview { font-size: 15px; }
 .composer-placeholder { font-size: 15px; }
 .composer .send { min-width: 34px; min-height: 34px; padding: 0; }
+.size-note { font-size: 12px; }
 .composer scrollbar slider { min-height: 12px; }    /* else the scrollbar keeps the box ~2 lines tall */
 """
 
@@ -199,6 +202,7 @@ class Window(Adw.ApplicationWindow):
         self.speaker_map = {}       # "HH:MM:SS|text start" -> assigned name, for the current meeting
         self.live_names = {}        # "Speaker 2" -> "Awan" while recording, so new lines follow your choice
         self.speaker_popover = None
+        self.show_sizes = bool(load_settings().get("show_sizes", False))    # data sizes shown everywhere
         self.bulk_marks = []          # TextMarks at the start of Ctrl-clicked transcript lines
         self.bulk_anchor = None       # last Ctrl-clicked line, for Shift+click ranges
         self.bulk_popover = None
@@ -286,6 +290,7 @@ class Window(Adw.ApplicationWindow):
 
         menu = Gio.Menu()
         menu.append("Learned voices…", "win.voices")
+        menu.append("Storage…", "win.storage")
         menu.append("Preferences", "app.preferences")
         menu.append("Quit MeetScribe", "app.quit")
         self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
@@ -293,6 +298,15 @@ class Window(Adw.ApplicationWindow):
         voices_action = Gio.SimpleAction.new("voices", None)
         voices_action.connect("activate", lambda _a, _p: self.open_voice_review())
         self.add_action(voices_action)
+        storage_action = Gio.SimpleAction.new("storage", None)
+        storage_action.connect("activate", lambda _a, _p: self.open_storage())
+        self.add_action(storage_action)
+        self.sizes_content = Adw.ButtonContent(icon_name="drive-harddisk-symbolic", label="")
+        self.sizes_btn = Gtk.ToggleButton(child=self.sizes_content, active=self.show_sizes)
+        self.sizes_btn.set_tooltip_text("Show how much disk space each meeting, model and file takes")
+        self.sizes_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Show data sizes"])
+        self.sizes_btn.connect("toggled", self.on_sizes_toggled)
+        header.pack_end(self.sizes_btn)
         header.pack_end(self.menu_btn)
         self.folder_btn = Gtk.Button(icon_name="folder-symbolic")
         self.folder_btn.set_tooltip_text("Open this meeting's folder (transcript, audio recordings, chat)")
@@ -325,6 +339,11 @@ class Window(Adw.ApplicationWindow):
                                        valign=Gtk.Align.START)
         self.meeting_empty.add_css_class("dim-label")
         box.append(self.meeting_empty)
+        self.storage_footer = Gtk.Button(visible=False)
+        self.storage_footer.add_css_class("flat")
+        self.storage_footer.set_tooltip_text("See what takes space and what you can clean up")
+        self.storage_footer.connect("clicked", lambda _b: self.open_storage())
+        box.append(self.storage_footer)
         view.set_content(box)
         return view
 
@@ -337,7 +356,13 @@ class Window(Adw.ApplicationWindow):
         self.model_tag.add_css_class("model-tag")
         self.model_tag.add_css_class("flat")
         self.model_tag.set_create_popup_func(self.fill_version_popover)
-        col.append(self.model_tag)
+        tags = Gtk.Box(spacing=10)
+        tags.append(self.model_tag)
+        self.size_label = Gtk.Label(xalign=0, wrap=True, visible=False, hexpand=True)
+        self.size_label.add_css_class("dim-label")
+        self.size_label.add_css_class("size-note")
+        tags.append(self.size_label)
+        col.append(tags)
         return col
 
     def build_title_row(self):
@@ -432,9 +457,11 @@ class Window(Adw.ApplicationWindow):
             check.connect("toggled", self.on_engine_changed)
             row = Adw.ActionRow(title=name, subtitle=info, activatable_widget=check)
             row.add_prefix(check)
+            row.info = info
             engine_rows.append(row)
             self.engine_checks.append(check)
         self.engine_checks[0].set_active(True)
+        self.engine_rows = engine_rows
         self.lang_row = Adw.ComboRow(title="Meeting language (Whisper only)",
                                      model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
         self.lang_row.set_tooltip_text("Choosing the language is more reliable than automatic detection.")
@@ -1131,6 +1158,9 @@ class Window(Adw.ApplicationWindow):
     def on_tick(self):
         if self.proc is not None:
             self.update_usage()
+            if self.show_sizes and int(time.monotonic()) % 5 == 0:
+                self.update_meeting_size()      # the recording grows
+                self.update_size_summary()
         if self.proc is not None and not self.retranscribing and self.state in ("downloading", "loading", "recording"):
             elapsed = int(time.monotonic() - self.record_start)
             self.timer_label.set_text(meetings.fmt_time(elapsed))
@@ -1162,8 +1192,10 @@ class Window(Adw.ApplicationWindow):
             texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
             name = Gtk.Label(label=meetings.title(folder), xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
             name.add_css_class("heading")
-            info = Gtk.Label(label="Recording now…" if folder == live else meetings.describe(folder), xalign=0,
-                             wrap=True)
+            text = "Recording now…" if folder == live else meetings.describe(folder)
+            if self.show_sizes:
+                text += f" · {datasize.fmt(datasize.meeting(folder)['total'])}"
+            info = Gtk.Label(label=text, xalign=0, wrap=True)
             info.add_css_class("dim-label")
             info.add_css_class("caption")
             texts.append(name)
@@ -1181,6 +1213,7 @@ class Window(Adw.ApplicationWindow):
             if self.out_dir is not None and folder == self.out_dir:
                 self.meeting_list.select_row(row)
         self.meeting_empty.set_visible(not folders)
+        self.update_size_summary()
 
     def on_meeting_row(self, _list, row):
         if self.proc is not None:
@@ -1311,6 +1344,7 @@ class Window(Adw.ApplicationWindow):
 
     def update_tag(self):
         """The pill under the title: which speech model made (or is making) the transcript on screen."""
+        self.update_meeting_size()
         tag = self.model_tag
         tag.remove_css_class("earlier")
         if self.proc is not None and self.state in RECORDING_STATES:
@@ -1364,6 +1398,14 @@ class Window(Adw.ApplicationWindow):
         entries = [(None, model, f"Current transcript · made {self.when_text(when)}")]
         entries += [(v, v["model"], f"Made {self.when_text(v['transcribed'])} · replaced {self.when_text(v['replaced'])}")
                     for v in versions]
+        if self.show_sizes:
+            current = sum(datasize.tree(self.out_dir / n) for n in meetings.VERSION_FILES)
+
+            def version_size(v):    # a versions/<stamp>/ folder, or an older single backup file
+                folder = v["path"].parent
+                return datasize.tree(v["path"]) if folder == self.out_dir else datasize.tree(folder)
+            entries = [(v, mid, f"{sub} · {datasize.fmt(current if v is None else version_size(v))}")
+                       for v, mid, sub in entries]
         for v, mid, sub in entries:
             shown = (v is None and self.viewing is None) or \
                     (v is not None and self.viewing is not None and v["id"] == self.viewing["id"])
@@ -1901,12 +1943,62 @@ class Window(Adw.ApplicationWindow):
         self.speakers_dialog = speakers.SpeakersDialog(on_changed=lambda: None, on_review=self.open_voice_review)
         self.speakers_dialog.present(self)
 
+    # --- data sizes ----------------------------------------------------
+    def on_sizes_toggled(self, btn):
+        self.show_sizes = btn.get_active()
+        save_settings({"show_sizes": self.show_sizes})
+        self.refresh_sidebar()          # meeting rows, header total and footer
+        self.update_meeting_size()
+
+    def update_meeting_size(self):
+        folder = self.out_dir
+        show = self.show_sizes and folder is not None and folder.exists()
+        self.size_label.set_visible(show)
+        if show:
+            self.size_label.set_text(datasize.meeting_line(datasize.meeting(folder)))
+
+    def update_size_summary(self):
+        """Header button label, sidebar footer and model sizes in the settings."""
+        if not hasattr(self, "sizes_btn"):
+            return
+        self.sizes_btn.remove_css_class("warning")
+        if not self.show_sizes:
+            self.sizes_content.set_label("")
+            self.storage_footer.set_visible(False)
+            for row in self.engine_rows:
+                row.set_subtitle(row.info)
+            return
+        o = datasize.overview(MEETINGS_DIR)
+        self.sizes_content.set_label(datasize.fmt(o["total"]))
+        tip = (f"MeetScribe data: {datasize.fmt(o['total'])} (meetings {datasize.fmt(o['totals']['meetings'])}, "
+               f"models {datasize.fmt(o['totals']['models'])}). Click to hide sizes.")
+        if o["warnings"]:
+            self.sizes_btn.add_css_class("warning")
+            tip = " ".join(o["warnings"]) + " " + tip
+        self.sizes_btn.set_tooltip_text(tip)
+        self.storage_footer.set_child(self.icon_label(
+            "dialog-warning-symbolic" if o["warnings"] else "drive-harddisk-symbolic",
+            f"All meetings: {datasize.fmt(o['totals']['meetings'])} · Storage…"))
+        self.storage_footer.set_visible(True)
+        for row, (_name, engine, model, _info, _f) in zip(self.engine_rows, ENGINES):
+            size = datasize.engine_size(engine, model)
+            row.set_subtitle(row.info + (f"\nOn disk: {datasize.fmt(size)}" if size else "\nNot downloaded yet"))
+
+    def open_storage(self):
+        storage.StorageDialog(MEETINGS_DIR, open_meeting=self.open_from_storage).present(self)
+
+    def open_from_storage(self, folder):
+        if self.proc is not None:
+            self.toast("Stop the recording first.")
+            return
+        self.load_folder(folder)
+
     def open_voice_review(self, name=None):
         """Review the clips each learned voice was built from (and remove the wrong ones)."""
         dialog = voicereview.VoiceReviewDialog(
             MEETINGS_DIR, play=lambda path, start, dur, label: self.play(path, start, dur, label),
             stop=self.stop_playback, is_playing=lambda: self.player is not None and self.player.poll() is None,
-            focus=name)
+            focus=name, show_sizes=self.show_sizes)
         dialog.connect("closed", lambda _d: getattr(self, "speakers_dialog", None) and self.speakers_dialog.refresh())
         dialog.present(self)
 

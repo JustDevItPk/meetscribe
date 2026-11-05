@@ -1,5 +1,6 @@
 """Review learned voices: every clip each person's voice was learned from, how well it fits, and ways to
 play and remove the ones that are wrong, so recognition gets more accurate over time."""
+import json
 import pathlib
 
 import gi
@@ -8,6 +9,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
+import datasize  # noqa: E402
 import meetings  # noqa: E402
 import voices  # noqa: E402
 
@@ -21,12 +23,13 @@ def pct(x):
 class VoiceReviewDialog(Adw.Dialog):
     """List of learned voices; each opens a page of its clips."""
 
-    def __init__(self, meetings_dir, play, stop, is_playing, focus=None):
+    def __init__(self, meetings_dir, play, stop, is_playing, focus=None, show_sizes=False):
         super().__init__(title="Learned voices", content_width=680, content_height=720)
         self.meetings_dir = pathlib.Path(meetings_dir)
         self.play, self.stop, self.is_playing = play, stop, is_playing
         self.playing = None             # (clip id, button) being played
         self.meeting_info = {}
+        self.show_sizes = show_sizes
         voices.migrate(self.meetings_dir)
         self.toasts = Adw.ToastOverlay()
         self.nav = Adw.NavigationView()
@@ -77,6 +80,9 @@ class VoiceReviewDialog(Adw.Dialog):
                         "to those clips and remove any that are someone else, noise or too short to tell. "
                         "Recognition uses what's left, from the next recording on.")
         prefs.add(group)
+        if self.show_sizes:
+            on_disk = sum(datasize.tree(f) for f in (voices.FILE, voices.CLIPS_FILE))
+            group.set_description(group.get_description() + f" Voice data on disk: {datasize.fmt(on_disk)}.")
         data = voices.load_clips()
         if not data:
             row = Adw.ActionRow(title="No voices learned yet",
@@ -88,7 +94,8 @@ class VoiceReviewDialog(Adw.Dialog):
             entry = data[name]
             secs = sum(voices.seconds(c) for c in entry["clips"]) + (entry["legacy"]["seconds"] if entry.get("legacy") else 0)
             row = Adw.ActionRow(title=name, activatable=True, use_markup=False)
-            row.set_subtitle(f"{len(entry['clips'])} clips · {secs / 60:.1f} min of speech")
+            row.set_subtitle(f"{len(entry['clips'])} clips · {secs / 60:.1f} min of speech" +
+                             (f" · {datasize.fmt(len(json.dumps(entry)))}" if self.show_sizes else ""))
             row.add_prefix(Gtk.Image(icon_name="avatar-default-symbolic"))
             row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
             row.connect("activated", lambda _r, n=name: self.open_person(n))
