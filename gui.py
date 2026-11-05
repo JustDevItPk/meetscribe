@@ -90,6 +90,14 @@ CSS = """
 .model-tag.earlier > button { background: alpha(var(--warning-bg-color), 0.2); color: var(--warning-color); }
 .version-bar { padding: 8px 12px; }
 .version-row { padding: 4px 6px; }
+.composer { background: var(--view-bg-color); border-radius: 20px; padding: 8px 8px 8px 14px;
+            border: 1px solid alpha(currentColor, 0.15); box-shadow: 0 1px 3px rgba(0,0,0,0.07); }
+.composer:focus-within { border-color: alpha(var(--accent-bg-color), 0.7); }
+.composer textview, .composer textview > text { background: transparent; }
+.composer textview { font-size: 15px; }
+.composer-placeholder { font-size: 15px; }
+.composer .send { min-width: 34px; min-height: 34px; padding: 0; }
+.composer scrollbar slider { min-height: 12px; }    /* else the scrollbar keeps the box ~2 lines tall */
 """
 
 
@@ -657,19 +665,87 @@ class Window(Adw.ApplicationWindow):
         self.c_stack.add_named(self.c_scroll, "messages")
         page.append(self.c_stack)
 
-        composer = Gtk.Box(spacing=8)
-        self.new_chat_btn = Gtk.Button(icon_name="list-add-symbolic")
+        page.append(self.build_composer())
+        return page
+
+    def build_composer(self):
+        """Chat input like other AI chat apps: a rounded box that grows with what you type or paste (then
+        scrolls), Enter sends, Shift+Enter starts a new line, send / stop button at the bottom right."""
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        card.add_css_class("composer")
+        self.entry_buf = Gtk.TextBuffer()
+        self.entry = Gtk.TextView(buffer=self.entry_buf, wrap_mode=Gtk.WrapMode.WORD_CHAR, accepts_tab=False,
+                                  top_margin=4, bottom_margin=4, hexpand=True)
+        self.entry.update_property([Gtk.AccessibleProperty.LABEL], ["Message to the agent"])
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_composer_key)
+        self.entry.add_controller(keys)
+        scroller = Gtk.ScrolledWindow(child=self.entry, hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                      propagate_natural_height=True, max_content_height=220,
+                                      min_content_height=28)     # one line; the default minimum is ~2 lines
+        # The box grows after the text arrives, but the text view keeps the scroll offset it had while it
+        # was smaller (a paste left the top lines out of sight above a blank gap): once the new size is in,
+        # bring the scroll position back in range and the cursor into view.
+        self.entry_scroller = scroller
+        self.entry_buf.connect("changed", lambda _b: GLib.timeout_add(30, self.fit_composer_scroll))
+        self.entry_placeholder = Gtk.Label(label="Ask anything about this meeting…", xalign=0,
+                                           valign=Gtk.Align.START, margin_top=4, can_target=False)
+        self.entry_placeholder.add_css_class("dim-label")
+        self.entry_placeholder.add_css_class("composer-placeholder")
+        overlay = Gtk.Overlay(child=scroller)
+        overlay.add_overlay(self.entry_placeholder)
+        card.append(overlay)
+        # clicking the padding around the text still puts the cursor in it
+        focus = Gtk.GestureClick()
+        focus.connect("pressed", lambda *_a: self.entry.get_sensitive() and self.entry.grab_focus())
+        card.add_controller(focus)
+
+        row = Gtk.Box(spacing=8)
+        self.new_chat_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.END)
+        self.new_chat_btn.add_css_class("flat")
+        self.new_chat_btn.add_css_class("circular")
         self.new_chat_btn.set_tooltip_text("New chat: clear this conversation and start fresh (transcript is kept)")
         self.new_chat_btn.update_property([Gtk.AccessibleProperty.LABEL], ["New chat"])
         self.new_chat_btn.connect("clicked", self.on_new_chat)
-        self.entry = Gtk.Entry(hexpand=True, placeholder_text="Ask a question…", width_chars=18)
-        self.entry.connect("activate", lambda _e: self.on_send())
-        self.send_btn = Gtk.Button()
+        row.append(self.new_chat_btn)
+        row.append(Gtk.Box(hexpand=True))
+        self.send_btn = Gtk.Button(icon_name="go-up-symbolic", valign=Gtk.Align.END)
+        self.send_btn.add_css_class("circular")
+        self.send_btn.add_css_class("send")
         self.send_btn.connect("clicked", lambda _b: self.on_send())
-        for w in (self.new_chat_btn, self.entry, self.send_btn):
-            composer.append(w)
-        page.append(composer)
-        return page
+        row.append(self.send_btn)
+        card.append(row)
+        self.entry_buf.connect("changed", lambda _b: self.update_composer())
+        return card
+
+    def fit_composer_scroll(self):
+        adj = self.entry_scroller.get_vadjustment()
+        page = self.entry_scroller.get_height()
+        if adj.get_page_size() != page:
+            adj.set_page_size(page)
+        adj.set_value(min(adj.get_value(), max(0.0, adj.get_upper() - page)))
+        self.entry.scroll_mark_onscreen(self.entry_buf.get_insert())
+        return False
+
+    def composer_text(self):
+        return self.entry_buf.get_text(self.entry_buf.get_start_iter(), self.entry_buf.get_end_iter(), False)
+
+    def on_composer_key(self, _ctl, key, _code, mods):
+        if key not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
+            return False
+        if mods & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.ALT_MASK):
+            return False                    # Shift+Enter: new line
+        if self.chat is not None and self.chat.busy:
+            return True                     # don't send while a reply is coming; keep what's typed
+        self.on_send()
+        return True
+
+    def update_composer(self):
+        """Placeholder while empty; send needs some text (stop is always available while replying)."""
+        has_text = bool(self.composer_text().strip())
+        self.entry_placeholder.set_visible(self.entry_buf.get_char_count() == 0)
+        if not (self.chat is not None and self.chat.busy):
+            self.send_btn.set_sensitive(getattr(self, "chat_ready", False) and has_text)
 
     # --- settings --------------------------------------------------
     def apply_saved_settings(self):
@@ -792,22 +868,22 @@ class Window(Adw.ApplicationWindow):
             self.c_stack.set_visible_child_name("messages")
         else:
             self.c_stack.set_visible_child_name("empty")
-        self.entry.set_sensitive(chat_ready and not chatting)
+        self.entry.set_sensitive(chat_ready)      # you can type the next question while Claude replies
         self.new_chat_btn.set_sensitive(chat_ready and not chatting and bool(self.chat.messages))
         for b in self.suggestion_btns:
             b.set_sensitive(chat_ready and not chatting)
-        self.send_btn.remove_css_class("suggested-action")
-        self.send_btn.remove_css_class("destructive-action")
+        self.chat_ready = chat_ready
+        self.send_btn.add_css_class("suggested-action")
         if chatting:
-            self.send_btn.set_child(self.icon_label("media-playback-stop-symbolic", "Stop"))
-            self.send_btn.add_css_class("destructive-action")
+            self.send_btn.set_icon_name("media-playback-stop-symbolic")
             self.send_btn.set_tooltip_text("Stop Claude's reply")
+            self.send_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Stop reply"])
             self.send_btn.set_sensitive(True)
         else:
-            self.send_btn.set_child(self.icon_label("mail-send-symbolic", "Send"))
-            self.send_btn.add_css_class("suggested-action")
-            self.send_btn.set_tooltip_text("Send your question to Claude (Enter)")
-            self.send_btn.set_sensitive(chat_ready)
+            self.send_btn.set_icon_name("go-up-symbolic")
+            self.send_btn.set_tooltip_text("Send (Enter). Shift+Enter for a new line.")
+            self.send_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Send message"])
+        self.update_composer()
 
     # --- recording -------------------------------------------------
     def on_start_stop(self, _btn):
@@ -1748,7 +1824,7 @@ class Window(Adw.ApplicationWindow):
         if self.chat is not None and self.chat.busy:
             self.chat.cancel()
             return
-        text = self.entry.get_text().strip()
+        text = self.composer_text().strip()
         if text:
             self.send_chat(text)
 
@@ -1756,7 +1832,7 @@ class Window(Adw.ApplicationWindow):
         if self.chat is None or self.chat.busy or not text.strip():
             return
         self.flush_transcript_save()      # the agent should see your corrections
-        self.entry.set_text("")
+        self.entry_buf.set_text("")
         self.c_stack.set_visible_child_name("messages")
         self.add_user_bubble(text)
         self.reply_text = ""
