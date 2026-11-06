@@ -43,7 +43,8 @@ class AgentDialog(Adw.Dialog):
             description="When you ask about a meeting, MeetScribe sends that meeting's transcript text (never the "
                         "audio) to the agent you choose. Agents on this computer keep everything on it.")
         self.service_ids = [s[0] for s in agents.SERVICES]
-        self.service_row = Adw.ComboRow(title="Service", model=Gtk.StringList.new([s[1] for s in agents.SERVICES]))
+        self.service_row = Adw.ComboRow(title="Service", model=Gtk.StringList.new([s[1] for s in agents.SERVICES]),
+                                        use_subtitle=True)    # long names in full, not cut off at the side
         pick.add(self.service_row)
         self.about_row = Adw.ActionRow(use_markup=False)        # what the chosen service is, in a sentence
         self.about_row.set_title_lines(3)

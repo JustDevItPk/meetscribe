@@ -168,6 +168,8 @@ def usage_note(cfg):
         return "Uses your Claude subscription; only the transcript text is sent, never the audio."
     if is_local(cfg):
         return "Runs on your own computer; nothing leaves it."
+    if service(cfg)["id"] == "custom":
+        return "Sends the transcript text (never the audio) to the server address above."
     return f"Uses your {service(cfg)['label'].split(' (')[0]} account; only the transcript text is sent, never the audio."
 
 

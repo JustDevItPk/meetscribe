@@ -37,6 +37,7 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import meetings  # noqa: E402
+import modelcatalog  # noqa: E402
 import voices  # noqa: E402
 
 RATE = 16000
@@ -291,6 +292,62 @@ def read_commands(switcher):
             switcher.request(parts[1], model, language)
 
 
+def download_for_library(model_id):
+    """--download: fetch one model for the "Speech models" library, reporting progress on stdout as
+    "STATE: downloading pct=N", then "DONE: <id>" or "ERROR: <message>". Cancelling is the app stopping this
+    process and deleting the model's folder (modelcatalog.delete)."""
+    model = modelcatalog.get(model_id)
+    if model is None:
+        say(f"ERROR: Unknown speech model “{model_id}”.")
+        sys.exit(2)
+    say("STATE: downloading pct=0")
+    last = [0]
+
+    def report(pct):
+        if pct is not None and pct != last[0]:
+            last[0] = pct
+            say(f"STATE: downloading pct={min(pct, 99)}")
+    try:
+        download_speaker_model()        # needed by every model; normally there since install
+        if model.engine == "parakeet":
+            download_parakeet(report)
+        else:
+            from huggingface_hub import snapshot_download
+            from huggingface_hub.utils import tqdm as hf_tqdm
+            bars = []
+
+            class Progress(hf_tqdm):
+                """Collects the byte counts snapshot_download reports; nothing is drawn."""
+                def __init__(self, *a, **k):
+                    k["file"] = open(os.devnull, "w")   # noqa: SIM115 - lives as long as the bar
+                    k["disable"] = False                # tqdm turns itself off without a terminal
+                    super().__init__(*a, **k)
+                    bars.append(self)
+
+            result = {}
+
+            def fetch():
+                try:
+                    # the same files faster-whisper fetches, so it finds the model afterwards
+                    result["path"] = snapshot_download(model.repo, tqdm_class=Progress, allow_patterns=[
+                        "config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"])
+                except Exception as e:  # noqa: BLE001 - reported below
+                    result["error"] = e
+            t = threading.Thread(target=fetch, daemon=True)
+            t.start()
+            while t.is_alive():
+                t.join(0.5)
+                fractions = [b.n / b.total for b in list(bars) if getattr(b, "unit", "") == "B" and b.total]
+                if fractions:
+                    report(int(max(fractions) * 100))
+            if "error" in result:
+                raise result["error"]
+    except Exception as e:  # noqa: BLE001 - the app shows it
+        say(f"ERROR: Couldn't download {model.name}: {e}")
+        sys.exit(1)
+    say(f"DONE: {model.id}")
+
+
 def whisper_path(name, report):
     from faster_whisper.utils import download_model
     try:
@@ -463,7 +520,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", help="output folder (default ~/MeetScribe/<timestamp>)")
     ap.add_argument("--engine", choices=["parakeet", "whisper"], default="parakeet")
-    ap.add_argument("--model", default="small", help="Whisper model: small, medium, large-v3-turbo")
+    ap.add_argument("--model", default="small",
+                    help="Whisper model: " + ", ".join(m.model for m in modelcatalog.MODELS if m.engine == "whisper"))
     ap.add_argument("--language", default=None, help="Whisper only, e.g. en, ur, ar (default: auto-detect)")
     ap.add_argument("--threads", type=int, help="CPU threads for transcription (default: 2 live, half the CPU after)")
     ap.add_argument("--live", action="store_true", help="with Whisper, transcribe during the call (heavy on CPU)")
@@ -478,7 +536,12 @@ def main():
                     help="accept commands on stdin while recording, e.g. ENGINE whisper medium en")
     ap.add_argument("--retranscribe", metavar="FOLDER", help="transcribe a finished meeting again from its saved audio")
     ap.add_argument("--prepare", action="store_true", help="download the Parakeet and speaker models and exit")
+    ap.add_argument("--download", metavar="MODEL_ID", help="download one model from the catalog (modelcatalog.py) and exit")
     args = ap.parse_args()
+
+    if args.download:
+        download_for_library(args.download)
+        return
 
     if args.prepare:
         download_parakeet(lambda pct: print(f"\rDownloading Parakeet model: {pct}%", end="", flush=True))

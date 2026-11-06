@@ -20,8 +20,6 @@ WARN_FREE_FRACTION = 0.10
 
 MEETING_PARTS = [("audio", "Audio recordings"), ("transcript", "Transcripts"),
                  ("versions", "Earlier transcripts"), ("chat", "Chat"), ("other", "Other files")]
-WHISPER_REPOS = {"models--Systran--faster-whisper-small": "Whisper small",
-                 "models--Systran--faster-whisper-medium": "Whisper medium"}
 STATIC_TTL = 600                # seconds to reuse model/app sizes (they rarely change)
 _static = {"at": 0.0, "value": None}
 
@@ -119,23 +117,16 @@ def models():
             else:
                 label = e.name
             out.append((label, e, tree(e), True))
+    import modelcatalog     # lazy: modelcatalog uses this module for sizes
+    names = {"models--" + m.repo.replace("/", "--"): m.name for m in modelcatalog.MODELS if m.repo}
     if HF_HUB.is_dir():
         for e in sorted(HF_HUB.iterdir()):
             if not e.name.startswith("models--") or "whisper" not in e.name.lower():
                 continue
-            label = WHISPER_REPOS.get(e.name)
+            label = names.get(e.name)
             pretty = e.name.split("--")[-1]
             out.append((label or f"{pretty} (not used by MeetScribe)", e, hf_repo(e), label is not None))
     return out
-
-
-def engine_size(engine, model):
-    """Bytes on disk for a transcription choice in the settings, or 0 if not downloaded."""
-    for label, _path, size, used in _static_parts()["models"]:
-        if used and ((engine == "parakeet" and label == "Parakeet") or
-                     (engine == "whisper" and label == f"Whisper {model}")):
-            return size
-    return 0
 
 
 def app_parts():
@@ -152,6 +143,11 @@ def app_parts():
                 code += tree(e)
     out.append(("MeetScribe itself", DATA, code))
     return sorted(out, key=lambda x: -x[2])
+
+
+def invalidate():
+    """Forget the cached model/app sizes (after a model is downloaded or deleted)."""
+    _static["value"] = None
 
 
 def _static_parts(force=False):
