@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # MeetScribe launcher.
 #   meetscribe                    open the window (--background: start hidden in the tray)
-#   meetscribe record [options]   record from the terminal (Ctrl+C to stop); see worker.py --help
+#   meetscribe record [options]   record from the terminal (Ctrl+C to stop); see `meetscribe record --help`
 #   meetscribe file AUDIO [opts]  transcribe an existing audio/video file
 #   meetscribe summarize FOLDER   summarize a meeting folder with Claude
+#   meetscribe --version          print the version
 set -euo pipefail
 d="$HOME/.local/share/meetscribe"
 case "${1:-gui}" in
@@ -11,5 +12,7 @@ case "${1:-gui}" in
   record) shift; exec "$d/venv/bin/python" "$d/worker.py" "$@" ;;
   file) shift; f="${1:?usage: meetscribe file AUDIO [options]}"; shift; exec "$d/venv/bin/python" "$d/worker.py" --file "$f" "$@" ;;
   summarize) exec /usr/bin/python3 "$d/summarize.py" "${2:?usage: meetscribe summarize FOLDER}" ;;
-  *) sed -n '2,6p' "$0"; exit 1 ;;
+  --version|version) exec /usr/bin/python3 -c "import sys; sys.path.insert(0, '$d'); import version; print('MeetScribe', version.__version__)" ;;
+  -h|--help|help) sed -n '2,7p' "$0" ;;
+  *) sed -n '2,7p' "$0"; exit 1 ;;
 esac

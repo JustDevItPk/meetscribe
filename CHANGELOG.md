@@ -1,0 +1,42 @@
+# Changelog
+
+All notable changes to MeetScribe are listed here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-11-06
+
+First public release.
+
+### Recording and transcription
+- Records the call (your computer's audio output) and your microphone as two tracks, with live transcription by
+  Parakeet TDT 0.6B v3 or Whisper small / medium, all on your computer.
+- Switch speech models in the middle of a meeting without losing anything.
+- Live CPU and memory panel while transcribing.
+- Follows device changes (e.g. plugging in a headset) and keeps both tracks and the transcript in step.
+- Microphone saved in Opus speech mode at 16 kbps (about a third smaller than before).
+
+### Speakers
+- Your microphone is labelled *You*; other voices are told apart and, once learned, named automatically.
+- Click a name to change it, *Replace all* for a detected speaker, or bulk assign several lines at once
+  (Ctrl+click, Shift+click or a text selection). One Ctrl+Z undoes a change.
+- *Learned voices*: review, play and remove the clips each voice was learned from; clips that sound like someone
+  else are flagged. Each clip now counts once, and moves when you reassign its line.
+
+### After the meeting
+- Ask Agent: chat with Claude about the meeting through Claude Code, with a multi-line composer
+  (Enter sends, Shift+Enter for a new line).
+- Transcribe again with another model; earlier transcripts are kept as versions you can open and restore.
+- Export to Word, PDF or Markdown, or as one mixed MP3 with background noise removed and voices evened out.
+- Click a timestamp to hear that moment; bookmarks; edit the transcript in place.
+
+### Housekeeping
+- Optional data-size view for every meeting, model and file, plus a Storage overview with warnings.
+- Tray icon, start at log-in, and a prompt when a call app starts using the microphone.
+- Meeting and settings folders are readable by your user only.
+- `install.sh` checks for libadwaita 1.6+, supports x86_64 and ARM64, and installs pinned engine versions;
+  new `uninstall.sh`; `meetscribe --version` and an About window.
+
+[Unreleased]: https://github.com/OWNER/meetscribe/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/OWNER/meetscribe/releases/tag/v0.1.0

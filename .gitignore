@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+venv
+venv/
+.venv/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Never commit real meetings or voice data
+MeetScribe/
+*.ogg
+*.wav
+*.mp3
+voices.json
+voice_clips.json
+speakers.json

@@ -30,6 +30,7 @@ import storage  # noqa: E402
 import tray  # noqa: E402
 import voicereview  # noqa: E402
 import voices  # noqa: E402
+from version import HOMEPAGE, __version__  # noqa: E402
 
 APP_ID = "dev.meetscribe.app"
 APP_DIR = pathlib.Path(__file__).resolve().parent
@@ -44,7 +45,7 @@ ENGINES = [
      "English and 24 European languages, detected automatically.", 0.2),
     ("Whisper small", "whisper", "small",
      "Urdu, Arabic, Hindi, Chinese and ~90 more. Transcribes live using about 4 CPU cores while people speak "
-     "(around 5× faster than speech on this laptop).", 0.25),
+     "(around 5× faster than speech on a typical 8-core laptop).", 0.25),
     ("Whisper medium", "whisper", "medium",
      "More accurate than Whisper small, still live, but only about 2× faster than speech, so during long "
      "stretches of talk it may fall a little behind and catch up in pauses. Downloads 1.5 GB the first time.", 0.5),
@@ -200,7 +201,7 @@ class Window(Adw.ApplicationWindow):
         self.loading_transcript = False
         self.save_timer = 0
         self.speaker_map = {}       # "HH:MM:SS|text start" -> assigned name, for the current meeting
-        self.live_names = {}        # "Speaker 2" -> "Awan" while recording, so new lines follow your choice
+        self.live_names = {}        # "Speaker 2" -> "Priya" while recording, so new lines follow your choice
         self.speaker_popover = None
         self.show_sizes = bool(load_settings().get("show_sizes", False))    # data sizes shown everywhere
         self.bulk_marks = []          # TextMarks at the start of Ctrl-clicked transcript lines
@@ -292,6 +293,7 @@ class Window(Adw.ApplicationWindow):
         menu.append("Learned voices…", "win.voices")
         menu.append("Storage…", "win.storage")
         menu.append("Preferences", "app.preferences")
+        menu.append("About MeetScribe", "app.about")
         menu.append("Quit MeetScribe", "app.quit")
         self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         self.menu_btn.set_tooltip_text("Learned voices, preferences and quit")
@@ -1496,7 +1498,7 @@ class Window(Adw.ApplicationWindow):
         box.append(note)
         lang = Gtk.DropDown(model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
         lang.set_selected(self.lang_row.get_selected())
-        for i, (name, engine, model, info, _f) in enumerate(ENGINES):
+        for i, (_name, engine, model, info, _f) in enumerate(ENGINES):
             mid = meetings.model_id(engine, model)
             current = mid == self.run_model
             pending = self.switching is not None and self.switching[0] == mid
@@ -2663,6 +2665,19 @@ class Window(Adw.ApplicationWindow):
         self.progress.set_text("Starting…")
 
     # --- preferences -------------------------------------------------------
+    def show_about(self):
+        about = Adw.AboutDialog(
+            application_name="MeetScribe", application_icon="audio-input-microphone", version=__version__,
+            developer_name="Saailverse Technologies", copyright="© 2026 Saailverse Technologies", license_type=Gtk.License.MIT_X11,
+            comments="Record and transcribe your meetings on your own computer, then ask Claude about them.")
+        if HOMEPAGE:
+            about.set_website(HOMEPAGE)
+            about.set_issue_url(HOMEPAGE.rstrip("/") + "/issues")
+        about.add_credit_section("Speech recognition", [
+            "Parakeet TDT by NVIDIA (CC-BY-4.0)", "Whisper by OpenAI, via faster-whisper (MIT)",
+            "sherpa-onnx by k2-fsa (Apache-2.0)", "ERes2Net speaker model by 3D-Speaker (Apache-2.0)"])
+        about.present(self)
+
     def open_preferences(self):
         p = prefs()
         dialog = Adw.PreferencesDialog(title="Preferences")
@@ -2784,6 +2799,7 @@ class App(Adw.Application):
         for name, handler in (("show", self.show_window), ("start-recording", self.start_recording),
                               ("stop-recording", self.stop_recording), ("bookmark", lambda: self.win.add_bookmark()),
                               ("preferences", lambda: (self.show_window(), self.win.open_preferences())),
+                              ("about", lambda: (self.show_window(), self.win.show_about())),
                               ("quit", self.quit_all)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", lambda _a, _p, h=handler: h())
@@ -2892,8 +2908,19 @@ class App(Adw.Application):
                 self.win.toast(f"{app_name} released your microphone.", "Stop recording", self.stop_recording)
 
 
+def make_private(*folders):
+    """Recordings, transcripts and voiceprints are personal: keep their folders readable by you only."""
+    for folder in folders:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            folder.chmod(0o700)
+        except OSError:
+            pass
+
+
 def main():
     os.chdir(pathlib.Path.home())
+    make_private(MEETINGS_DIR, CONFIG_DIR)
     background = "--background" in sys.argv
     App(background=background).run([sys.argv[0]])
 

@@ -505,6 +505,10 @@ def main():
         name = pathlib.Path(args.file).stem + "_" if args.file else ""
         out = pathlib.Path.home() / "MeetScribe" / (name + stamp)
     out.mkdir(parents=True, exist_ok=True)
+    try:
+        out.chmod(0o700)            # recordings are personal: readable by you only
+    except OSError:
+        pass
 
     q, stats = queue.Queue(), Stats()
     streams = []
