@@ -73,7 +73,7 @@ sudo pacman -S python-gobject gtk4 libadwaita libpulse ffmpeg curl
 ## Install
 
 ```bash
-git clone https://github.com/OWNER/meetscribe.git
+git clone https://github.com/JustDevItPk/meetscribe.git
 cd meetscribe
 ./install.sh
 ```

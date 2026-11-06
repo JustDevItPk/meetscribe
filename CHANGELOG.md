@@ -38,5 +38,5 @@ First public release.
 - `install.sh` checks for libadwaita 1.6+, supports x86_64 and ARM64, and installs pinned engine versions;
   new `uninstall.sh`; `meetscribe --version` and an About window.
 
-[Unreleased]: https://github.com/OWNER/meetscribe/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/OWNER/meetscribe/releases/tag/v0.1.0
+[Unreleased]: https://github.com/JustDevItPk/meetscribe/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/JustDevItPk/meetscribe/releases/tag/v0.1.0
