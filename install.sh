@@ -7,7 +7,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 dest="$HOME/.local/share/meetscribe"
-FILES=(worker gui chat speakers voices voicereview datasize storage meetings procstats tray callwatch export summarize version)
+FILES=(worker gui chat speakers voices voicereview datasize storage meetings modelcatalog modellibrary procstats tray callwatch export summarize version)
 
 hint() {
   if command -v apt >/dev/null; then echo "  sudo apt install $1"

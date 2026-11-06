@@ -24,6 +24,8 @@ import callwatch  # noqa: E402
 import chat  # noqa: E402
 import datasize  # noqa: E402
 import meetings  # noqa: E402
+import modelcatalog  # noqa: E402
+import modellibrary  # noqa: E402
 import procstats  # noqa: E402
 import speakers  # noqa: E402
 import storage  # noqa: E402
@@ -38,18 +40,7 @@ CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.h
 MEETINGS_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_MEETINGS_DIR", pathlib.Path.home() / "MeetScribe"))
 AUTOSTART = pathlib.Path.home() / ".config/autostart" / f"{APP_ID}.desktop"
 
-# (menu label, engine, whisper model, explanation, rough processing time as a fraction of meeting length)
-ENGINES = [
-    ("Parakeet (recommended)", "parakeet", None,
-     "Fast and light: transcribes live while using a small share of two CPU cores. "
-     "English and 24 European languages, detected automatically.", 0.2),
-    ("Whisper small", "whisper", "small",
-     "Urdu, Arabic, Hindi, Chinese and ~90 more. Transcribes live using about 4 CPU cores while people speak "
-     "(around 5× faster than speech on a typical 8-core laptop).", 0.25),
-    ("Whisper medium", "whisper", "medium",
-     "More accurate than Whisper small, still live, but only about 2× faster than speech, so during long "
-     "stretches of talk it may fall a little behind and catch up in pauses. Downloads 1.5 GB the first time.", 0.5),
-]
+OLD_ENGINE_SETTING = {0: "parakeet", 1: "whisper-small", 2: "whisper-medium"}   # settings saved before the model library
 LANGUAGES = [
     ("Detect automatically", ""), ("English", "en"), ("Urdu", "ur"), ("Arabic", "ar"), ("Hindi", "hi"),
     ("Chinese", "zh"), ("Spanish", "es"), ("French", "fr"), ("German", "de"), ("Portuguese", "pt"),
@@ -90,6 +81,8 @@ CSS = """
 .meeting-title { font-size: 20px; font-weight: 800; }
 .model-tag > button { min-height: 26px; padding: 0 12px; border-radius: 999px; font-size: 12px; font-weight: 600;
                       background: alpha(var(--accent-bg-color), 0.14); color: var(--accent-color); }
+.model-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+               background: alpha(var(--accent-bg-color), 0.14); color: var(--accent-color); }
 .model-tag.earlier > button { background: alpha(var(--warning-bg-color), 0.2); color: var(--warning-color); }
 .version-bar { padding: 8px 12px; }
 .version-row { padding: 4px 6px; }
@@ -203,6 +196,7 @@ class Window(Adw.ApplicationWindow):
         self.speaker_map = {}       # "HH:MM:SS|text start" -> assigned name, for the current meeting
         self.live_names = {}        # "Speaker 2" -> "Priya" while recording, so new lines follow your choice
         self.speaker_popover = None
+        self.downloads = None       # modellibrary.Downloads, made when the library is first opened
         self.show_sizes = bool(load_settings().get("show_sizes", False))    # data sizes shown everywhere
         self.bulk_marks = []          # TextMarks at the start of Ctrl-clicked transcript lines
         self.bulk_anchor = None       # last Ctrl-clicked line, for Shift+click ranges
@@ -290,6 +284,7 @@ class Window(Adw.ApplicationWindow):
         header.pack_start(self.speakers_btn)
 
         menu = Gio.Menu()
+        menu.append("Speech models…", "win.models")
         menu.append("Learned voices…", "win.voices")
         menu.append("Storage…", "win.storage")
         menu.append("Preferences", "app.preferences")
@@ -297,6 +292,9 @@ class Window(Adw.ApplicationWindow):
         menu.append("Quit MeetScribe", "app.quit")
         self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         self.menu_btn.set_tooltip_text("Learned voices, preferences and quit")
+        models_action = Gio.SimpleAction.new("models", None)
+        models_action.connect("activate", lambda _a, _p: self.open_model_library())
+        self.add_action(models_action)
         voices_action = Gio.SimpleAction.new("voices", None)
         voices_action.connect("activate", lambda _a, _p: self.open_voice_review())
         self.add_action(voices_action)
@@ -450,20 +448,12 @@ class Window(Adw.ApplicationWindow):
         group = Adw.PreferencesGroup()
         self.settings_expander = Adw.ExpanderRow(title="Recording settings", icon_name="emblem-system-symbolic")
         group.add(self.settings_expander)
-        # Engines are radio rows rather than a dropdown so names and explanations are never cut off.
-        engine_rows, self.engine_checks = [], []
-        for name, _, _, info, _ in ENGINES:
-            check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-            if self.engine_checks:
-                check.set_group(self.engine_checks[0])
-            check.connect("toggled", self.on_engine_changed)
-            row = Adw.ActionRow(title=name, subtitle=info, activatable_widget=check)
-            row.add_prefix(check)
-            row.info = info
-            engine_rows.append(row)
-            self.engine_checks.append(check)
-        self.engine_checks[0].set_active(True)
-        self.engine_rows = engine_rows
+        self.engine_rows, self.engine_checks, self.models = [], {}, []
+        self.more_models_row = Adw.ActionRow(title="Get more speech models…", activatable=True,
+                                             subtitle="See which models suit this computer, and download or remove them.")
+        self.more_models_row.add_prefix(Gtk.Image(icon_name="folder-download-symbolic"))
+        self.more_models_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        self.more_models_row.connect("activated", lambda _r: self.open_model_library())
         self.lang_row = Adw.ComboRow(title="Meeting language (Whisper only)",
                                      model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
         self.lang_row.set_tooltip_text("Choosing the language is more reliable than automatic detection.")
@@ -473,8 +463,7 @@ class Window(Adw.ApplicationWindow):
                                         subtitle="What other people say, captured from your computer's audio output.")
         self.mic_row = Adw.SwitchRow(title="Record my microphone", active=True,
                                      subtitle="What you say. Wear headphones so the meeting audio doesn't echo into your mic.")
-        for row in (*engine_rows, self.lang_row, self.system_row, self.mic_row):
-            self.settings_expander.add_row(row)
+        self.fill_model_rows()
         for row in (self.lang_row, self.system_row, self.mic_row):
             row.connect("notify::selected" if isinstance(row, Adw.ComboRow) else "notify::active",
                         lambda *_: self.update_settings_summary())
@@ -489,18 +478,64 @@ class Window(Adw.ApplicationWindow):
         factory.connect("bind", lambda _f, item: item.get_child().set_label(item.get_item().get_string()))
         return factory
 
-    def get_engine(self):
-        return next(i for i, c in enumerate(self.engine_checks) if c.get_active())
+    def fill_model_rows(self):
+        """(Re)build Recording settings: one radio row per downloaded speech model, "Get more speech models…",
+        then the language and audio-source rows. Keeps the current choice when that model is still there."""
+        keep = self.get_engine() if self.engine_checks else None
+        for row in (*self.engine_rows, self.more_models_row, self.lang_row, self.system_row, self.mic_row):
+            if row.get_parent() is not None:
+                self.settings_expander.remove(row)
+        self.models = modelcatalog.downloaded()
+        specs = modelcatalog.detect()
+        self.engine_rows, self.engine_checks = [], {}
+        self.engine_anchor = None
+        # Models are radio rows rather than a dropdown so names and explanations are never cut off. They join a
+        # hidden button's group so they look like radio buttons even when only one model is downloaded.
+        anchor = self.engine_anchor = Gtk.CheckButton()
+        for m in self.models:
+            check = Gtk.CheckButton(valign=Gtk.Align.CENTER, group=anchor)
+            check.connect("toggled", self.on_engine_changed)
+            info = f"{m.languages}. {modelcatalog.fit(m, specs, True).label}."
+            row = Adw.ActionRow(title=m.name, subtitle=info, activatable_widget=check)
+            row.add_prefix(check)
+            row.info, row.model = info, m
+            self.engine_rows.append(row)
+            self.engine_checks[m.id] = check
+        for row in (*self.engine_rows, self.more_models_row, self.lang_row, self.system_row, self.mic_row):
+            self.settings_expander.add_row(row)
+        self.set_engine(keep if keep in self.engine_checks else self.fallback_model())
+        self.update_size_summary()
 
-    def set_engine(self, index):
-        self.engine_checks[index].set_active(True)
+    def fallback_model(self):
+        """The model to use when the chosen one isn't available: Parakeet, else the first downloaded one."""
+        ids = [m.id for m in self.models]
+        return modelcatalog.DEFAULT if modelcatalog.DEFAULT in ids else (ids[0] if ids else None)
+
+    def get_engine(self):
+        """Id of the speech model chosen in Recording settings (None if no model is downloaded)."""
+        return next((mid for mid, c in self.engine_checks.items() if c.get_active()), None)
+
+    def set_engine(self, model_id):
+        if model_id in self.engine_checks:
+            self.engine_checks[model_id].set_active(True)
+
+    def refresh_models(self):
+        """After a model is downloaded or deleted."""
+        datasize.invalidate()
+        before = self.get_engine()
+        self.fill_model_rows()
+        if before and self.get_engine() != before:
+            save_settings(self.current_settings())
+            self.toast(f"{meetings.model_name(before)} was removed, so new meetings use "
+                       f"{meetings.model_name(self.get_engine())}.")
+        self.update_settings_summary()
 
     def update_settings_summary(self):
         """One-line summary shown on the collapsed settings row."""
         cfg = self.current_settings()
-        name, engine = ENGINES[cfg["engine"]][:2]
-        parts = [name.replace(" (recommended)", "")]
-        if engine == "whisper":
+        m = modelcatalog.get(cfg["model"])
+        parts = [m.name if m else "No speech model downloaded"]
+        if m and m.engine == "whisper" and m.multilingual:
             parts.append(LANGUAGES[self.lang_row.get_selected()][0])
         sources = [w for w, on in (("meeting audio", cfg["system"]), ("your mic", cfg["mic"])) if on]
         parts.append(" + ".join(sources) if sources else "nothing selected to record")
@@ -780,25 +815,25 @@ class Window(Adw.ApplicationWindow):
     def apply_saved_settings(self):
         s = load_settings()
         langs = [c for _, c in LANGUAGES]
-        if isinstance(s.get("engine"), int) and 0 <= s["engine"] < len(ENGINES):
-            self.set_engine(s["engine"])
+        chosen = s.get("model") or OLD_ENGINE_SETTING.get(s.get("engine"))
+        self.set_engine(chosen if chosen in self.engine_checks else self.fallback_model())
         if s.get("language") in langs:
             self.lang_row.set_selected(langs.index(s["language"]))
         self.system_row.set_active(s.get("system", True))
         self.mic_row.set_active(s.get("mic", True))
-        self.settings_expander.set_expanded("engine" not in s)  # open on first launch so the choices are visible
+        self.settings_expander.set_expanded("model" not in s and "engine" not in s)  # first launch: show the choices
         self.update_settings_summary()
 
     def current_settings(self):
-        return {"engine": self.get_engine(),
+        return {"model": self.get_engine(),
                 "language": LANGUAGES[self.lang_row.get_selected()][1],
                 "system": self.system_row.get_active(), "mic": self.mic_row.get_active()}
 
     def on_engine_changed(self, *_):
-        if not hasattr(self, "mic_row") or not any(c.get_active() for c in self.engine_checks):
+        if not hasattr(self, "mic_row") or self.get_engine() is None:
             return      # still building, or mid-switch between radio buttons
-        engine = ENGINES[self.get_engine()][1]
-        self.lang_row.set_sensitive(engine == "whisper")
+        m = modelcatalog.get(self.get_engine())
+        self.lang_row.set_sensitive(m.engine == "whisper" and m.multilingual)
         self.update_settings_summary()
 
     # --- state machine ---------------------------------------------
@@ -941,12 +976,17 @@ class Window(Adw.ApplicationWindow):
         if not cfg["system"] and not cfg["mic"]:
             self.toast("Turn on “Record meeting audio”, “Record my microphone”, or both.")
             return
+        chosen = modelcatalog.get(cfg["model"])
+        if chosen is None:
+            self.toast("Download a speech model first: Recording settings → Get more speech models…")
+            self.open_model_library()
+            return
         cmd = self.worker_cmd()
         if cmd is None:
             return
         save_settings(cfg)
-        _, engine, model = ENGINES[cfg["engine"]][:3]
-        self.run_model = meetings.model_id(engine, model)
+        engine, model = chosen.engine, chosen.model
+        self.run_model = chosen.id
         self.leave_version()
         self.out_dir = MEETINGS_DIR / time.strftime("%Y-%m-%d_%H%M%S")
         meetings.save_meta(self.out_dir, started=datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1498,15 +1538,15 @@ class Window(Adw.ApplicationWindow):
         box.append(note)
         lang = Gtk.DropDown(model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
         lang.set_selected(self.lang_row.get_selected())
-        for i, (_name, engine, model, info, _f) in enumerate(ENGINES):
-            mid = meetings.model_id(engine, model)
+        for m in self.models:
+            mid, info = m.id, m.languages
             current = mid == self.run_model
             pending = self.switching is not None and self.switching[0] == mid
             texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, hexpand=True)
             head = Gtk.Label(label=meetings.model_name(mid) + (" (in use)" if current else
                                                                 " (loading…)" if pending else ""), xalign=0)
             head.add_css_class("heading" if current else "body")
-            sub = Gtk.Label(label=info.split(". ")[0] + ".", xalign=0, wrap=True, max_width_chars=44)
+            sub = Gtk.Label(label=info + ".", xalign=0, wrap=True, max_width_chars=44)
             sub.add_css_class("dim-label")
             sub.add_css_class("caption")
             texts.append(head)
@@ -1518,8 +1558,8 @@ class Window(Adw.ApplicationWindow):
                 row.append(Gtk.Image(icon_name="object-select-symbolic"))
             b = Gtk.Button(child=row, sensitive=not current and self.switching is None)
             b.add_css_class("flat")
-            b.connect("clicked", lambda _b, k=i: (self.version_popover.popdown(),
-                                                  self.request_switch(k, LANGUAGES[lang.get_selected()][1])))
+            b.connect("clicked", lambda _b, k=mid: (self.version_popover.popdown(),
+                                                    self.request_switch(k, LANGUAGES[lang.get_selected()][1])))
             box.append(b)
         lang_row = Gtk.Box(spacing=8, margin_top=6)
         lang_label = Gtk.Label(label="Language (Whisper only)", xalign=0, hexpand=True)
@@ -1529,14 +1569,14 @@ class Window(Adw.ApplicationWindow):
         box.append(lang_row)
         self.version_popover.set_child(box)
 
-    def request_switch(self, index, language):
+    def request_switch(self, mid, language):
         """Ask the running recorder to change speech model; capture carries on uninterrupted."""
         if self.proc is None or self.retranscribing or self.switching is not None:
             return
-        _, engine, model = ENGINES[index][:3]
-        mid = meetings.model_id(engine, model)
-        if mid == self.run_model:
-            return
+        m = modelcatalog.get(mid)
+        if m is None or m not in self.models or mid == self.run_model:
+            return      # only downloaded models: the recorder mustn't start a big download mid-meeting
+        engine, model = m.engine, m.model
         try:
             self.proc.stdin.write(f"ENGINE {engine} {model or '-'} {language or '-'}\n")
             self.proc.stdin.flush()
@@ -1544,7 +1584,7 @@ class Window(Adw.ApplicationWindow):
             self.toast(f"Couldn't switch the model: {e}")
             return
         self.switching = (mid, "…")
-        self.switch_choice = (index, language)
+        self.switch_choice = (mid, language)
         self.update_tag()
 
     def on_switch(self, words):
@@ -1562,7 +1602,7 @@ class Window(Adw.ApplicationWindow):
             old = meetings.model_name(self.run_model)
             self.run_model, self.switching = mid, None
             choice = getattr(self, "switch_choice", None)
-            if choice and meetings.model_id(*ENGINES[choice[0]][1:3]) == mid:
+            if choice and choice[0] == mid:
                 self.set_engine(choice[0])      # the settings show what is in use, and the next meeting starts with it
                 langs = [c for _, c in LANGUAGES]
                 if choice[1] in langs:
@@ -1982,9 +2022,8 @@ class Window(Adw.ApplicationWindow):
             "dialog-warning-symbolic" if o["warnings"] else "drive-harddisk-symbolic",
             f"All meetings: {datasize.fmt(o['totals']['meetings'])} · Storage…"))
         self.storage_footer.set_visible(True)
-        for row, (_name, engine, model, _info, _f) in zip(self.engine_rows, ENGINES):
-            size = datasize.engine_size(engine, model)
-            row.set_subtitle(row.info + (f"\nOn disk: {datasize.fmt(size)}" if size else "\nNot downloaded yet"))
+        for row in self.engine_rows:
+            row.set_subtitle(row.info + f"\nOn disk: {datasize.fmt(modelcatalog.size_on_disk(row.model))}")
 
     def open_storage(self):
         storage.StorageDialog(MEETINGS_DIR, open_meeting=self.open_from_storage).present(self)
@@ -1994,6 +2033,36 @@ class Window(Adw.ApplicationWindow):
             self.toast("Stop the recording first.")
             return
         self.load_folder(folder)
+
+    # --- speech model library --------------------------------------------------------
+    def open_model_library(self):
+        if self.downloads is None:
+            self.downloads = modellibrary.Downloads(APP_DIR / "venv/bin/python", APP_DIR / "worker.py",
+                                                    self.on_model_downloaded)
+        modellibrary.ModelLibraryDialog(self.downloads, in_use=self.model_in_use, can_delete=self.model_cannot_go,
+                                        on_changed=self.refresh_models).present(self)
+
+    def model_in_use(self, model_id):
+        """Why a model can't be deleted right now (shown as "In use"), or ""."""
+        if self.proc is not None and model_id in (self.run_model or "").split("+") + \
+                [self.switching[0] if self.switching else None]:
+            return "It's transcribing right now. You can delete it after the recording."
+        return ""
+
+    def model_cannot_go(self, model_id):
+        if self.model_in_use(model_id):
+            return self.model_in_use(model_id)
+        if [m.id for m in self.models] == [model_id]:
+            return "MeetScribe needs at least one speech model. Download another one first."
+        return None
+
+    def on_model_downloaded(self, model_id, ok, error):
+        name = meetings.model_name(model_id)
+        if ok:
+            self.refresh_models()
+            self.toast(f"{name} is ready. Choose it in Recording settings.")
+        else:
+            self.toast(error or f"Couldn't download {name}.")
 
     def open_voice_review(self, name=None):
         """Review the clips each learned voice was built from (and remove the wrong ones)."""
@@ -2609,18 +2678,24 @@ class Window(Adw.ApplicationWindow):
                         "the meeting's saved audio. The current transcript is kept, and you can open it again from "
                         "the “Transcribed with” tag. Speakers are detected again, and voices you have named before "
                         "are recognised automatically.")
-        checks = []
-        for name, _engine, _model, _info, factor in ENGINES:
-            check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-            if checks:
-                check.set_group(checks[0])
-            est = max(1, round(minutes * factor))
-            row = Adw.ActionRow(title=name, subtitle=f"About {est} minute{'s' if est > 1 else ''} for this "
-                                                     f"{minutes}-minute meeting.", activatable_widget=check)
+        checks = {}
+        specs = modelcatalog.detect()
+        anchor = Gtk.CheckButton()      # hidden: keeps a lone choice looking like a radio button
+        for m in self.models:
+            check = Gtk.CheckButton(valign=Gtk.Align.CENTER, group=anchor)
+            est = max(1, round(minutes * modelcatalog.processing_factor(m, specs)))
+            row = Adw.ActionRow(title=m.name, subtitle=f"{m.languages}. About {est} minute{'s' if est > 1 else ''} "
+                                                       f"for this {minutes}-minute meeting.", activatable_widget=check)
             row.add_prefix(check)
             group.add(row)
-            checks.append(check)
-        checks[2].set_active(True)
+            checks[m.id] = check
+        if checks:      # suggest the most accurate model you have
+            checks[max(self.models, key=lambda m: m.rank).id].set_active(True)
+        more = Adw.ActionRow(title="Get more speech models…", activatable=True,
+                             subtitle="Larger models are slower but more accurate, which suits transcribing again.")
+        more.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        more.connect("activated", lambda _r: (dialog.close(), self.open_model_library()))
+        group.add(more)
         lang = Adw.ComboRow(title="Meeting language (Whisper only)", model=Gtk.StringList.new([n for n, _ in LANGUAGES]))
         lang.set_factory(self.plain_factory())
         lang.set_list_factory(self.plain_factory())
@@ -2629,14 +2704,16 @@ class Window(Adw.ApplicationWindow):
         go = Gtk.Button(label="Start", halign=Gtk.Align.CENTER, margin_top=12)
         go.add_css_class("suggested-action")
         go.add_css_class("pill")
+        go.set_sensitive(bool(checks))
+        dialog.radio_anchor = anchor
         go.connect("clicked", lambda _b: (dialog.close(), self.start_retranscribe(
-            next(i for i, c in enumerate(checks) if c.get_active()), LANGUAGES[lang.get_selected()][1])))
+            next(mid for mid, c in checks.items() if c.get_active()), LANGUAGES[lang.get_selected()][1])))
         group.add(go)
         page.add(group)
         self.retx_dialog = dialog
         dialog.present(self)
 
-    def start_retranscribe(self, engine_index, language):
+    def start_retranscribe(self, model_id, language):
         if self.out_dir is None or self.proc is not None:
             return
         cmd = self.worker_cmd()
@@ -2644,8 +2721,9 @@ class Window(Adw.ApplicationWindow):
             return
         self.flush_transcript_save()
         self.stop_playback()
-        _, engine, model = ENGINES[engine_index][:3]
-        self.run_model = meetings.model_id(engine, model)
+        chosen = modelcatalog.get(model_id)
+        engine, model = chosen.engine, chosen.model
+        self.run_model = chosen.id
         self.leave_version()
         cmd += ["--retranscribe", str(self.out_dir), "--engine", engine]
         if engine == "whisper":
@@ -2660,7 +2738,7 @@ class Window(Adw.ApplicationWindow):
         if not self.launch(cmd):
             self.retranscribing = False
             return
-        self.set_state("finishing", f"Using {ENGINES[engine_index][0]}. You can keep using your computer.")
+        self.set_state("finishing", f"Using {chosen.name}. You can keep using your computer.")
         self.progress.set_fraction(0)
         self.progress.set_text("Starting…")
 

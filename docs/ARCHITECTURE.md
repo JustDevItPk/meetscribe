@@ -13,6 +13,7 @@ detail.
 │   ├─ speakers.py     speaker list + "Speakers" dialog                             │
 │   ├─ voicereview.py  "Learned voices" dialog                                      │
 │   ├─ storage.py      "Storage" dialog            datasize.py  disk-usage figures  │
+│   ├─ modellibrary.py "Speech models" dialog + background model downloads         │
 │   ├─ chat.py         Ask Agent, via the `claude` CLI (Claude Code)                │
 │   └─ procstats.py    CPU / memory of the recorder, read from /proc                │
 └───────────────┬──────────────────────────────────────────────────────────────────┘
@@ -22,12 +23,13 @@ detail.
 │ worker.py  capture (parec) → speech chunks → Parakeet / Whisper → speaker voices │
 │ export.py  Word / PDF export (python-docx, fpdf2)                                │
 └──────────────────────────────────────────────────────────────────────────────────┘
-        shared, pure Python: meetings.py (meeting folders), voices.py (voice profiles), version.py
+        shared, pure Python: meetings.py (meeting folders), voices.py (voice profiles),
+                             modelcatalog.py (speech models), version.py
 ```
 
 The window needs GTK, which is easiest from the distribution's Python. The speech engines need numpy,
 onnxruntime and CTranslate2 wheels, which the installer puts in a private Python 3.12 so they never clash with
-system packages. Modules used by both sides (`meetings.py`, `voices.py`) must stay **pure Python** with no
+system packages. Modules used by both sides (`meetings.py`, `voices.py`, `modelcatalog.py`) must stay **pure Python** with no
 third-party imports.
 
 `install.sh` copies the `.py` files into `~/.local/share/meetscribe/`; the app runs from there, not from the
@@ -83,6 +85,23 @@ files.
   versions/<stamp>/         earlier transcripts, each with version.json
   bookmarks.json, chat.json, chat.md
 ```
+
+## Speech models
+
+`modelcatalog.py` (pure Python, shared) lists every supported model: engine, languages, download size, memory
+needed, reference speed, accuracy and license. It also reads this computer's specs from `/proc`, estimates each
+model's live speed from its cores, gives a fit verdict, and knows where each model lives on disk: Parakeet in
+`~/.local/share/meetscribe/models/`, Whisper in the Hugging Face cache (`~/.cache/huggingface/hub`, or
+`$HF_HUB_CACHE`). Settings store the chosen model's id (`"model": "whisper-small"`).
+
+`modellibrary.py` is the *Speech models* dialog plus a small download manager owned by the window, so a download
+keeps going when the dialog is closed. Downloading runs `worker.py --download <id>` in MeetScribe's own Python,
+which prints `STATE: downloading pct=N` and then `DONE: <id>` or `ERROR: …`; cancelling stops it and deletes the
+half-finished files. Deleting (`modelcatalog.delete`) only removes that model's folder, plus shared Hugging Face
+blobs nothing else links to.
+
+To add a model, add a `Model(...)` entry to `modelcatalog.MODELS` (Whisper models must be ones faster-whisper
+can load by name) and a display name to `meetings.MODEL_NAMES`.
 
 ## Learned voices
 

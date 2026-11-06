@@ -19,9 +19,11 @@ your computer.
 
 ## Features
 
-- **Live transcription, fully local.** Choose Parakeet (fast, English + 24 European languages) or Whisper
-  small / medium (about 100 languages, including Urdu, Arabic, Hindi and Chinese). You can switch models in
+- **Live transcription, fully local.** Choose Parakeet (fast, English + 24 European languages) or one of six
+  Whisper models (about 100 languages, including Urdu, Arabic, Hindi and Chinese). You can switch models in
   the middle of a meeting without losing anything.
+- **A model library that knows your computer.** See each model's memory, processor and disk needs, how well it
+  would run on *this* computer, and download or remove models with one click.
 - **Who said what.** Your microphone is always labelled *You*. Other voices are told apart and named
   automatically once MeetScribe has learned them.
 - **Fix speakers quickly.** Click a name to change it, *Replace all* for every line of a detected speaker,
@@ -51,9 +53,10 @@ your computer.
 
 - **Linux with PipeWire or PulseAudio** (the default on current Ubuntu, Fedora and Debian).
 - **GTK 4 and libadwaita 1.6+ for Python**: Ubuntu 25.04+, Fedora 41+, Debian 13+, Arch.
-- **x86_64 or ARM64**, about **1.5 GB of disk** for the app and the Parakeet model (+0.5 GB for Whisper small,
-  +1.5 GB for Whisper medium, downloaded when first used).
-- A CPU with 4+ cores is plenty for Parakeet; Whisper live transcription is comfortable on 8 cores.
+- **x86_64 or ARM64**, about **1.5 GB of disk** for the app and the Parakeet model, plus whatever Whisper models
+  you download (75 MB to 3 GB each).
+- **4 GB of memory** or more. A CPU with 4+ cores is plenty for Parakeet; the larger Whisper models want 8 cores
+  for live transcription. No graphics card is needed. The model library tells you what suits your computer.
 - Optional: **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**, signed in, for Ask Agent and
   summaries.
 - Optional on GNOME: the **AppIndicator and KStatusNotifierItem** extension, to show the tray icon
@@ -101,13 +104,26 @@ follow-ups). Review and clean up their learned voices from **☰ → Learned voi
 
 ### Which speech model?
 
-| Model | Languages | Live CPU use | Download |
-|---|---|---|---|
-| **Parakeet TDT 0.6B v3** (default) | English + 24 European, auto-detected | ~2 cores | 640 MB (at install) |
-| **Whisper small** | ~100 | ~4 cores, about 5× faster than speech on a typical 8-core laptop | 460 MB |
-| **Whisper medium** | ~100, more accurate | ~4 cores, about 2× faster than speech; may lag in long monologues | 1.5 GB |
+Open **☰ → Speech models…** (or **Get more speech models…** in the recording settings). It shows your processor,
+memory and free disk space, then every model with what it needs and how well it would run on this computer,
+with **Download** and **Delete** buttons. Downloads run in the background, one at a time, and can be cancelled.
+Recording settings, *Transcribe again* and the live model switcher list the models you have downloaded.
 
-For other languages, set **Meeting language** in the recording settings rather than relying on detection.
+| Model | Languages | Memory | Download | Live, on a typical 8-core laptop |
+|---|---|---|---|---|
+| **Parakeet TDT 0.6B v3** (installed) | English + 24 European, auto-detected | ~1.2 GB | 640 MB | ~7× faster than speech on 2 cores |
+| Whisper tiny | ~100 | ~0.5 GB | 75 MB | very fast, rough accuracy |
+| Whisper base | ~100 | ~0.6 GB | 141 MB | very fast, basic accuracy |
+| **Whisper small** | ~100 | ~1 GB | 464 MB | ~5× faster than speech on 4 cores |
+| Whisper medium | ~100, more accurate | ~2.5 GB | 1.5 GB | ~2×; may lag in long monologues |
+| Whisper large-v3 turbo | ~100, close to large-v3 | ~2.7 GB | 1.5 GB | ~1.5× (estimated) |
+| Whisper large-v3 | ~100, most accurate | ~4.8 GB | 2.9 GB | too slow live; fine for *Transcribe again* |
+| Distil-Whisper large-v3 | English only | ~2.5 GB | 1.4 GB | ~2× (estimated) |
+
+Speeds for Parakeet, Whisper small and medium were measured; the others are estimated from model size. A model
+that is too slow to keep up live still works: the transcript catches up after the meeting, and it's a good choice
+for *Transcribe again*. For other languages, set **Meeting language** in the recording settings rather than relying
+on detection.
 
 ### Command line
 

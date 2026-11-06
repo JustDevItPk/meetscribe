@@ -5,6 +5,22 @@ All notable changes to MeetScribe are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Speech model library** (☰ → Speech models…, or *Get more speech models…* in the recording settings): your
+  computer's processor, memory and free disk space; every supported model with its languages, accuracy, memory,
+  processor and disk needs; a verdict on how well it would run here (runs well / may fall behind live / too slow
+  for live use / not enough memory or disk) and suggestions for English and for other languages. Download (with
+  progress, in the background, cancellable) and delete models from there.
+- New models: Whisper tiny, base, large-v3 turbo, large-v3 and Distil-Whisper large-v3 (English).
+- `worker.py --download <model id>` for scripted downloads.
+
+### Changed
+- Recording settings, *Transcribe again* and the live model switcher list only the models on this computer; if
+  the chosen model is deleted, new meetings fall back to Parakeet. *Transcribe again* suggests your most accurate
+  model and estimates the time for this computer.
+- Deleting a Whisper model also frees the large files newer Hugging Face downloads keep in a shared folder (only
+  when no other model uses them).
+
 ## [0.1.0] - 2026-11-06
 
 First public release.
