@@ -21,6 +21,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 import callwatch  # noqa: E402
+import agents  # noqa: E402
+import agentsetup  # noqa: E402
 import chat  # noqa: E402
 import datasize  # noqa: E402
 import meetings  # noqa: E402
@@ -204,6 +206,7 @@ class Window(Adw.ApplicationWindow):
         self.live_names = {}        # "Speaker 2" -> "Priya" while recording, so new lines follow your choice
         self.speaker_popover = None
         self.show_sizes = bool(load_settings().get("show_sizes", False))    # data sizes shown everywhere
+        self.agent_cfg = agents.load_config()   # which AI answers in Ask Agent
         self.bulk_marks = []          # TextMarks at the start of Ctrl-clicked transcript lines
         self.bulk_anchor = None       # last Ctrl-clicked line, for Shift+click ranges
         self.bulk_popover = None
@@ -663,17 +666,28 @@ class Window(Adw.ApplicationWindow):
     def build_chat_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.c_stack = Gtk.Stack(vexpand=True)
-        locked = Adw.StatusPage(icon_name="user-available-symbolic", title="Chat with Claude about your meeting",
-                                description="Available once a recording has finished, or after you open a previous "
-                                            "meeting. Claude reads the transcript and answers like a normal chat.")
+        # which agent answers, and a way to change it
+        bar = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+        self.agent_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.agent_label.add_css_class("dim-label")
+        self.agent_label.add_css_class("caption")
+        change = Gtk.Button(label="Change…")
+        change.add_css_class("flat")
+        change.set_tooltip_text("Choose which AI answers: Claude, ChatGPT, Gemini, a model on this computer…")
+        change.connect("clicked", lambda _b: self.open_agent_setup())
+        bar.append(Gtk.Image(icon_name="user-available-symbolic"))
+        bar.append(self.agent_label)
+        bar.append(change)
+        page.append(bar)
+
+        locked = Adw.StatusPage(icon_name="user-available-symbolic")
         locked.add_css_class("compact")
         self.c_stack.add_named(locked, "locked")
+        self.chat_locked = locked
 
-        empty = Adw.StatusPage(icon_name="user-available-symbolic", title="Ask the agent anything about this meeting",
-                               description="Claude has the full transcript. Pick a suggestion or type your own "
-                                           "question below. Uses your Claude subscription; only the transcript "
-                                           "text is sent, never the audio.")
+        empty = Adw.StatusPage(icon_name="user-available-symbolic", title="Ask the agent anything about this meeting")
         empty.add_css_class("compact")
+        self.chat_empty = empty
         flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=2, column_spacing=8,
                            row_spacing=8, halign=Gtk.Align.CENTER)
         self.suggestion_btns = []
@@ -683,7 +697,14 @@ class Window(Adw.ApplicationWindow):
             b.connect("clicked", lambda _b, t=text: self.send_chat(t))
             flow.append(b)
             self.suggestion_btns.append(b)
-        empty.set_child(flow)
+        start = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.agent_setup_btn = Gtk.Button(label="Set up an AI agent…", halign=Gtk.Align.CENTER)
+        self.agent_setup_btn.add_css_class("suggested-action")
+        self.agent_setup_btn.add_css_class("pill")
+        self.agent_setup_btn.connect("clicked", lambda _b: self.open_agent_setup())
+        start.append(self.agent_setup_btn)
+        start.append(flow)
+        empty.set_child(start)
         self.c_stack.add_named(empty, "empty")
 
         self.msg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -695,7 +716,36 @@ class Window(Adw.ApplicationWindow):
         page.append(self.c_stack)
 
         page.append(self.build_composer())
+        self.refresh_agent_texts()
         return page
+
+    # --- AI agent ------------------------------------------------------------------------------------------
+    def refresh_agent_texts(self):
+        """Name the chosen agent wherever the chat talks about it."""
+        cfg = self.agent_cfg
+        name = agents.display_name(cfg)
+        issue = chat.agent_problem(cfg)
+        self.agent_label.set_text(f"Answers from {agents.describe(cfg)}")
+        self.chat_locked.set_title(f"Chat with {name} about your meeting")
+        self.chat_locked.set_description("Available once a recording has finished, or after you open a previous "
+                                         f"meeting. {name} reads the transcript and answers like a normal chat.")
+        if issue:
+            self.chat_empty.set_description(f"{issue} Set up an AI agent to ask questions about this meeting: "
+                                            "Claude, ChatGPT, Gemini, or a free model on this computer.")
+        else:
+            self.chat_empty.set_description(f"{name} has the full transcript. Pick a suggestion or type your own "
+                                            f"question below. {agents.usage_note(cfg)}")
+        self.agent_setup_btn.set_visible(bool(issue))
+
+    def open_agent_setup(self, reason=None, then=None):
+        """The "AI agent" window; `then` runs after a successful save (e.g. sending the question you typed)."""
+        def saved(cfg):
+            self.agent_cfg = cfg
+            self.refresh_agent_texts()
+            self.toast(f"Ask Agent now uses {agents.describe(cfg)}")
+            if then is not None:
+                then()
+        agentsetup.AgentDialog(on_saved=saved, reason=reason).present(self)
 
     def build_composer(self):
         """Chat input like other AI chat apps: a rounded box that grows with what you type or paste (then
@@ -897,7 +947,7 @@ class Window(Adw.ApplicationWindow):
             self.c_stack.set_visible_child_name("messages")
         else:
             self.c_stack.set_visible_child_name("empty")
-        self.entry.set_sensitive(chat_ready)      # you can type the next question while Claude replies
+        self.entry.set_sensitive(chat_ready)      # you can type the next question while the agent replies
         self.new_chat_btn.set_sensitive(chat_ready and not chatting and bool(self.chat.messages))
         for b in self.suggestion_btns:
             b.set_sensitive(chat_ready and not chatting)
@@ -905,7 +955,7 @@ class Window(Adw.ApplicationWindow):
         self.send_btn.add_css_class("suggested-action")
         if chatting:
             self.send_btn.set_icon_name("media-playback-stop-symbolic")
-            self.send_btn.set_tooltip_text("Stop Claude's reply")
+            self.send_btn.set_tooltip_text("Stop the reply")
             self.send_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Stop reply"])
             self.send_btn.set_sensitive(True)
         else:
@@ -1823,7 +1873,7 @@ class Window(Adw.ApplicationWindow):
             if m["role"] == "user":
                 self.add_user_bubble(m["text"])
             else:
-                set_markdown(self.add_assistant_bubble(m["text"]), m["text"])
+                set_markdown(self.add_assistant_bubble(m["text"], m.get("agent") or chat.CLAUDE), m["text"])
         self.refresh_buttons()
 
     def add_user_bubble(self, text):
@@ -1835,9 +1885,9 @@ class Window(Adw.ApplicationWindow):
         self.msg_box.append(row)
         self.scroll_chat()
 
-    def add_assistant_bubble(self, text_for_copy):
+    def add_assistant_bubble(self, text_for_copy, author_name=None):
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.START, margin_end=40)
-        author = Gtk.Label(label="Claude", xalign=0)
+        author = Gtk.Label(label=author_name or agents.display_name(self.agent_cfg), xalign=0)
         author.add_css_class("bubble-author")
         author.add_css_class("dim-label")
         bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1875,18 +1925,22 @@ class Window(Adw.ApplicationWindow):
     def send_chat(self, text):
         if self.chat is None or self.chat.busy or not text.strip():
             return
+        issue = chat.agent_problem(self.agent_cfg)
+        if issue:                          # first use, or the chosen agent isn't ready: set it up, then send
+            self.open_agent_setup(reason=issue, then=lambda: self.send_chat(text))
+            return
         self.flush_transcript_save()      # the agent should see your corrections
         self.entry_buf.set_text("")
         self.c_stack.set_visible_child_name("messages")
         self.add_user_bubble(text)
         self.reply_text = ""
         self.reply_label = self.add_assistant_bubble("")
-        self.reply_label.set_text("Claude is thinking…")
+        self.reply_label.set_text(f"{agents.display_name(self.agent_cfg)} is thinking…")
         self.reply_label.add_css_class("dim-label")
         self.reply_label.copy_btn.set_visible(False)
         self.chat.send(text, lambda chunk: GLib.idle_add(self.on_chat_delta, chunk),
                        lambda full, err: GLib.idle_add(self.on_chat_done, full, err),
-                       participants=self.agent_context())
+                       participants=self.agent_context(), agent=self.agent_cfg)
         self.refresh_buttons()
 
     def on_chat_delta(self, chunk):
@@ -1915,7 +1969,8 @@ class Window(Adw.ApplicationWindow):
                 if not text:
                     label.set_text("No reply.")
         if error and error != "Stopped.":
-            self.toast("Claude couldn't answer. See the message in the chat.")
+            self.toast(f"{agents.display_name(self.agent_cfg)} couldn't answer. See the message in the chat.",
+                       "AI agent…", self.open_agent_setup)
         self.refresh_buttons()
         self.entry.grab_focus()
         return False
@@ -2669,7 +2724,7 @@ class Window(Adw.ApplicationWindow):
         about = Adw.AboutDialog(
             application_name="MeetScribe", application_icon="audio-input-microphone", version=__version__,
             developer_name="Saailverse Technologies", copyright="© 2026 Saailverse Technologies", license_type=Gtk.License.MIT_X11,
-            comments="Record and transcribe your meetings on your own computer, then ask Claude about them.")
+            comments="Record and transcribe your meetings on your own computer, then ask an AI agent about them.")
         if HOMEPAGE:
             about.set_website(HOMEPAGE)
             about.set_issue_url(HOMEPAGE.rstrip("/") + "/issues")
@@ -2704,8 +2759,17 @@ class Window(Adw.ApplicationWindow):
         meet = Adw.PreferencesGroup(title="Meetings")
         meet.add(rows["detect_calls"])
         meet.add(rows["speakers"])
+        ai = Adw.PreferencesGroup(title="AI agent", description="Who answers in Ask Agent and in “meetscribe summarize”.")
+        agent_row = Adw.ActionRow(title=agents.describe(self.agent_cfg), subtitle=agents.usage_note(self.agent_cfg),
+                                  use_markup=False)
+        agent_row.set_subtitle_lines(2)
+        change = Gtk.Button(label="Change…", valign=Gtk.Align.CENTER)
+        change.connect("clicked", lambda _b: (dialog.close(), self.open_agent_setup()))
+        agent_row.add_suffix(change)
+        ai.add(agent_row)
         page.add(bg)
         page.add(meet)
+        page.add(ai)
         dialog.add(page)
 
         def changed(row, _param, key):

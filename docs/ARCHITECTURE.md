@@ -13,7 +13,10 @@ detail.
 │   ├─ speakers.py     speaker list + "Speakers" dialog                             │
 │   ├─ voicereview.py  "Learned voices" dialog                                      │
 │   ├─ storage.py      "Storage" dialog            datasize.py  disk-usage figures  │
-│   ├─ chat.py         Ask Agent, via the `claude` CLI (Claude Code)                │
+│   ├─ chat.py         Ask Agent conversations (Claude Code CLI or an API agent)    │
+│   ├─ agents.py       AI agents: settings, OpenAI / Anthropic / Ollama streaming   │
+│   ├─ agentkeys.py    API keys in the desktop keyring (or a 0600 file)              │
+│   ├─ agentsetup.py   "AI agent" window: choose, connect, test                      │
 │   └─ procstats.py    CPU / memory of the recorder, read from /proc                │
 └───────────────┬──────────────────────────────────────────────────────────────────┘
        stdin:   │ ENGINE whisper medium en          ▲ stdout: one message per line
@@ -84,6 +87,29 @@ files.
   bookmarks.json, chat.json, chat.md
 ```
 
+## Ask Agent and AI agents
+
+`agents.py` lists the services (`SERVICES`) and keeps the choice in `settings.json` under `"agent"`
+(`service`, `base_url`, `model`, never a key). There are four kinds:
+
+- **claude-code**: `chat.py` runs `claude -p --tools "" --append-system-prompt-file <context>` with
+  `--session-id`/`--resume`, as before; the context file holds the system prompt, participants and transcript.
+- **openai** (any OpenAI-compatible `/chat/completions`), **anthropic** (`/v1/messages`) and **ollama**
+  (`/api/chat`): `agents.stream_reply()` sends the system prompt with the transcript plus the whole conversation
+  every time and streams the answer (server-sent events, or NDJSON for Ollama) with `urllib` only. It estimates
+  the size first and refuses with a clear message when the model's context window is known to be too small; for
+  Ollama it asks the model's limit (`/api/show`) and sets `num_ctx` to fit the meeting, since Ollama otherwise
+  reads only its small default window. HTTP and network errors become sentences saying what to do
+  (`http_problem`, `network_problem`).
+
+`chat.json` keeps `messages` (each answer with the `agent` that gave it), and for Claude Code its `session_id`
+and `session_turns`, the number of messages that session has seen. When another agent answered in between, the
+next Claude Code question starts a new session with the earlier conversation in its context. Old chat files
+(no `agent`, no `session_turns`) resume as before.
+
+The window checks `chat.agent_problem()` before sending; if the agent isn't ready (no `claude` command, no key,
+no model) it opens the AI agent window and sends the question once that is saved.
+
 ## Learned voices
 
 `~/.config/meetscribe/voices.json` holds one averaged voiceprint per person, which is all the recorder reads.
@@ -94,8 +120,9 @@ clips were kept.
 
 ## Testing
 
-- `tests/` covers the pure modules (`meetings`, `voices`, `datasize`, `procstats`) and runs anywhere with
-  pytest. See [CONTRIBUTING.md](../CONTRIBUTING.md).
+- `tests/` covers the pure modules (`meetings`, `voices`, `datasize`, `procstats`, `agents`, `chat`) and runs
+  anywhere with pytest. `tests/mockagents.py` is a local server that answers like OpenAI, Anthropic and Ollama,
+  and `tests/test_chat.py` puts a fake `claude` command on `PATH`, so no real keys or subscription are used. See [CONTRIBUTING.md](../CONTRIBUTING.md).
 - The window can be driven without a real call: create `gui.Window` inside an `Adw.Application` with
   `MEETSCRIBE_CONFIG_DIR` and `MEETSCRIBE_MEETINGS_DIR` pointing at temporary folders, call its methods from
   `GLib.timeout_add`, and render screenshots with `Gtk.WidgetPaintable`. Under Xvfb, real clicks and keys can

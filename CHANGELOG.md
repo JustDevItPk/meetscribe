@@ -5,6 +5,20 @@ All notable changes to MeetScribe are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Choose your AI agent.** Ask Agent and `meetscribe summarize` can use Claude Code (still the default), OpenAI,
+  the Anthropic API, Google Gemini, OpenRouter, Groq, Mistral, Together AI, Ollama or LM Studio on your own
+  computer, or any OpenAI-compatible server. A new *AI agent* window (Preferences, or *Change…* in Ask Agent)
+  lists each service's models, tests the connection and says where your transcript goes.
+- If no agent is ready when you ask a question, MeetScribe opens the AI agent window and sends your question once
+  it's set up.
+- Answers are labelled with the model that gave them, also in `chat.md` and exports; you can switch agents in the
+  middle of a chat and the new one sees the conversation so far.
+- API keys are stored in the desktop keyring (or a file only you can read), never in `settings.json`; the usual
+  environment variables (`OPENAI_API_KEY`, …) work too.
+- Clear messages when a meeting is too long for the chosen model, a key is refused, a model doesn't exist, a rate
+  limit is hit or a local server isn't running. Ollama gets a context window sized to the meeting.
+
 ## [0.1.0] - 2026-11-06
 
 First public release.

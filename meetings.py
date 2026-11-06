@@ -294,7 +294,7 @@ def build_markdown(folder, messages, participants, summary=True, conversation=Fa
     if conversation and messages:
         parts += ["## Ask Agent conversation", ""]
         for m in messages:
-            who = "**You:**" if m["role"] == "user" else "**Agent:**"
+            who = "**You:**" if m["role"] == "user" else f"**{m.get('agent') or 'Agent'}:**"
             parts += [who, "", demote(m["text"]), ""]
     if transcript:
         path = transcript_file(folder)
