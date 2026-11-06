@@ -315,6 +315,13 @@ class Stream(threading.Thread):
     reconnects if the device disappears or the default device changes) or a fixed command (file mode).
     """
 
+    # How each recording is saved. Your mic is speech only, so it uses Opus's speech mode at 16 kbps: about a
+    # third smaller than 24 kbps, and transcribed just as well when tested on real recordings. Meeting audio
+    # can carry music or screen-share sound, so it keeps the general-purpose setting.
+    ENCODING = {"You": ["-b:a", "16k", "-application", "voip"], "Them": ["-b:a", "24k"]}
+    T0 = None   # time.monotonic() when recording began, shared by the streams to keep their timelines in step
+    GAP = 2     # frames (0.2 s) behind the clock before silence is filled in
+
     def __init__(self, label, source, out_q, stats, save_to=None):
         super().__init__(daemon=True)
         self.label, self.source, self.out_q, self.stats, self.save_to = label, source, out_q, stats, save_to
@@ -356,7 +363,8 @@ class Stream(threading.Thread):
         enc = None
         if self.save_to:
             enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", "-",
-                                    "-c:a", "libopus", "-b:a", "24k", "-flush_packets", "1", str(self.save_to)],
+                                    "-c:a", "libopus", *self.ENCODING.get(self.label, ["-b:a", "24k"]),
+                                    "-flush_packets", "1", str(self.save_to)],
                                    stdin=subprocess.PIPE)      # flush so earlier moments can be played mid-call
         frames, active, quiet, pos, start, pre = [], False, 0, 0, 0, None
         while True:
@@ -365,6 +373,20 @@ class Stream(threading.Thread):
             except (OSError, subprocess.SubprocessError) as e:
                 say(f"NOTICE: Cannot capture {self.label}: {e}. Retrying...")
                 self.proc = None
+            if self.proc and callable(self.source) and self.T0 is not None:
+                # Time that passed without audio (starting up, or reconnecting after a device change) becomes
+                # silence, so this recording, its transcript times and the other recording stay in step.
+                behind = int((time.monotonic() - self.T0) * 10) - pos
+                if behind >= self.GAP:
+                    if active and frames:
+                        self.emit(frames, start)
+                    frames, active, quiet, pre = [], False, 0, None
+                    if enc:
+                        try:
+                            enc.stdin.write(bytes(FRAME * 2 * behind))
+                        except (BrokenPipeError, ValueError):
+                            enc = None
+                    pos += behind
             while self.proc:
                 raw = self.proc.stdout.read(FRAME * 2)
                 if len(raw) < FRAME * 2:
@@ -532,6 +554,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
+    Stream.T0 = time.monotonic()
     for s in streams:   # start capturing now so nothing is missed while the model loads
         s.start()
     say(f"OUT: {out}")

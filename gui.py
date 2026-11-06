@@ -2176,27 +2176,40 @@ class Window(Adw.ApplicationWindow):
             if search is not None:
                 GLib.idle_add(lambda: search.grab_focus() and False)
 
-    def fill_speaker_menu(self, popover, lines):
+    def fill_speaker_menu(self, popover, lines, replace=None):
         """Put the "who is speaking?" list into `popover` for transcript `lines` (one line, or several
-        for bulk assign). Returns its search entry, if any, for focusing."""
+        for bulk assign). With `replace` (a speaker name) it is instead the "Replace all" list: picking a
+        name relabels every line of that speaker. Returns its search entry, if any, for focusing."""
         names = {self.line_info(n)[2].group(2) for n in lines}
-        current = next(iter(names)) if len(names) == 1 else None
-        bulk = len(lines) > 1
+        current = replace or (next(iter(names)) if len(names) == 1 else None)
+        bulk = len(lines) > 1 and not replace
+        same = len(self.speaker_lines(current)) if current else 0
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         for side in ("top", "bottom", "start", "end"):
             getattr(box, f"set_margin_{side}")(6)
-        title = Gtk.Label(label=f"Bulk assign speaker · {len(lines)} chunks" if bulk else "Who is speaking?",
-                          xalign=0)
+        if replace:
+            heading = f"Replace all “{replace}”"
+        else:
+            heading = f"Bulk assign speaker · {len(lines)} chunks" if bulk else "Who is speaking?"
+        title = Gtk.Label(label=heading, xalign=0)
         title.add_css_class("heading")
         box.append(title)
-        group = not bulk and bool(SPEAKER_N_RE.match(current))
+        if replace:
+            note = Gtk.Label(label=f"Choose the right speaker. All {same} line{'s' if same != 1 else ''} "
+                                   f"labelled {replace}\nin this meeting will change.", xalign=0)
+            note.add_css_class("dim-label")
+            box.append(note)
+        group = not bulk and not replace and bool(SPEAKER_N_RE.match(current))
         follow = Gtk.CheckButton(
             label=f"All lines from {current}" if group else "Also the following “Them” lines\n(until someone else speaks)",
             active=group)
 
         def pick(name):
             popover.popdown()
-            self.assign_speaker(lines, name, follow.get_active() and not bulk)
+            if replace:
+                self.replace_speaker(replace, name)
+            else:
+                self.assign_speaker(lines, name, follow.get_active() and not bulk)
         people = speakers.load()
         if not people:
             note = Gtk.Label(label="No speakers yet.", xalign=0)
@@ -2217,6 +2230,7 @@ class Window(Adw.ApplicationWindow):
             if any(tip):
                 b.set_tooltip_text(" · ".join(t for t in tip if t))
             b.connect("clicked", lambda _b, name=person["name"]: pick(name))
+            b.set_sensitive(not (replace and person["name"] == replace))
             people_box.append(b)
             buttons.append((f"{person['name']} {person.get('email') or ''}".lower(), b))
         search = None
@@ -2246,9 +2260,21 @@ class Window(Adw.ApplicationWindow):
             b.add_css_class("flat")
             b.get_child().set_xalign(0)
             b.connect("clicked", lambda _b, n=name: pick(n))
+            b.set_sensitive(not (replace and name == replace))
             box.append(b)
-        if not bulk and (people or group):
+        if not bulk and not replace and (people or group):
             box.append(follow)
+        if not bulk and not replace and same > 1:
+            def to_replace(_b):
+                found = self.fill_speaker_menu(popover, lines, replace=current)
+                if found is not None:
+                    found.grab_focus()
+            swap = Gtk.Button(child=self.icon_label("edit-find-replace-symbolic",
+                                                    f"Replace all “{current}” ({same} lines)…"))
+            swap.add_css_class("flat")
+            swap.set_tooltip_text(f"Give every line labelled {current} in this meeting to someone else")
+            swap.connect("clicked", to_replace)
+            box.append(swap)
         manage = Gtk.Button(child=self.icon_label("system-users-symbolic", "Add or remove speakers…"))
         manage.add_css_class("flat")
         manage.connect("clicked", lambda _b: (popover.popdown(), self.open_speakers_dialog()))
@@ -2256,10 +2282,10 @@ class Window(Adw.ApplicationWindow):
         popover.set_child(box)
         return search
 
-    def assign_speaker(self, lines, name, follow=False):
+    def assign_speaker(self, lines, name, follow=False, message=None):
         """Give transcript `lines` (a line number or a list, for bulk assign) to `name`; with `follow` and
         one line, also every line of that detected speaker (for "Speaker N") or the following unnamed
-        "Them" lines."""
+        "Them" lines. `message` replaces the usual "N lines assigned to …" toast text."""
         for pop in (self.speaker_popover, self.bulk_popover):
             if pop is not None:
                 pop.popdown()
@@ -2307,7 +2333,7 @@ class Window(Adw.ApplicationWindow):
             self.flush_transcript_save()     # write it now rather than after the usual pause
         who = "you" if name == "You" else name
         count = f"{len(targets)} line{'s' if len(targets) > 1 else ''}"
-        msg = f"Bulk assigned {count} to {who}" if bulk else f"{count} assigned to {who}"
+        msg = message or (f"Bulk assigned {count} to {who}" if bulk else f"{count} assigned to {who}")
         voices.migrate(MEETINGS_DIR)        # no-op once the clip list exists
         if name not in ("You", "Them") and samples:
             voices.learn(name, samples)     # also takes these moments out of anyone they were learned for
@@ -2315,6 +2341,28 @@ class Window(Adw.ApplicationWindow):
         elif samples:
             voices.unlearn(samples)
         self.toast(msg)
+
+    def speaker_lines(self, name):
+        """Every transcript line currently labelled `name`."""
+        return [n for n in range(self.t_buf.get_line_count())
+                if (i := self.line_info(n)) is not None and i[2].group(2) == name]
+
+    def replace_speaker(self, old, new):
+        """Replace all: every line labelled `old` in this transcript becomes `new` (one Ctrl+Z undoes it)."""
+        targets = self.speaker_lines(old)
+        if not targets or old == new:
+            return
+        if self.proc is not None and not self.retranscribing:
+            # while recording, lines that still arrive under the old name (or under a voice you had
+            # pointed at it) follow the change too; "You"/"Them" are whole streams, so they don't
+            for label, named in list(self.live_names.items()):
+                if named == old:
+                    self.live_names[label] = new
+            if old not in ("You", "Them"):
+                self.live_names[old] = new
+        who = "you" if new == "You" else new
+        count = f"{len(targets)} line{'s' if len(targets) > 1 else ''}"
+        self.assign_speaker(targets, new, message=f"Replaced “{old}” with {who} on {count}")
 
     def voice_samples(self, stamp, text):
         """The recorded segment behind a transcript line as a voice clip (see voices.clip), if any."""
@@ -2397,10 +2445,94 @@ class Window(Adw.ApplicationWindow):
         inc.add(go)
         page.add(fmt_group)
         page.add(inc)
+        page.add(self.build_audio_export_group())
         self.export_dialog = dialog
         self.export_checks = checks
         self.export_rows = rows
         dialog.present(self)
+
+    def build_audio_export_group(self):
+        group = Adw.PreferencesGroup(title="Audio")
+        have = [kind for name, kind in meetings.AUDIO_FILES if (self.out_dir / name).exists()]
+        recording = self.proc is not None and not self.retranscribing
+        row = Adw.ActionRow(title="One mixed audio file (.mp3)")
+        row.set_subtitle_lines(0)
+        if recording:
+            row.set_subtitle("Available when the recording has finished.")
+        elif not have:
+            row.set_subtitle("This meeting has no saved audio.")
+        else:
+            row.set_subtitle("Everyone on the call and your mic in one file, with background noise removed and "
+                             "voices evened out. Your original recordings stay as they are.")
+        go = Gtk.Button(label="Export audio…", valign=Gtk.Align.CENTER, sensitive=bool(have) and not recording)
+        go.connect("clicked", lambda _b: self.choose_audio_file())
+        row.add_suffix(go)
+        group.add(row)
+        return group
+
+    def choose_audio_file(self):
+        if getattr(self, "audio_export", None) is not None:
+            self.toast("Already exporting audio. It'll be ready shortly.")
+            return
+        folder = self.out_dir
+        name = re.sub(r"[^\w\- ,.]+", "", meetings.title(folder)).strip() or "meeting"
+        dialog = Gtk.FileDialog(title="Export meeting audio", initial_name=f"{name}.mp3")
+        music = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC) or \
+            GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS) or str(pathlib.Path.home())
+        dialog.set_initial_folder(Gio.File.new_for_path(music))
+
+        def done(d, result):
+            try:
+                target = pathlib.Path(d.save_finish(result).get_path())
+            except GLib.Error:
+                return
+            if target.suffix.lower() != ".mp3":
+                target = target.with_name(target.name + ".mp3")
+            if self.export_dialog is not None:
+                self.export_dialog.close()
+            self.export_audio(folder, target)
+        dialog.save(self, None, done)
+
+    def export_audio(self, folder, target):
+        """Mix the meeting's recordings into one MP3 in the background, with progress in a toast."""
+        cmd = meetings.mixed_audio_command(folder, target)
+        if cmd is None:
+            self.toast("This meeting has no saved audio.")
+            return
+        total = max(1, meetings.duration(folder) or 1)
+        toast = Adw.Toast(title="Exporting audio…", timeout=0, use_markup=False)
+        self.toasts.add_toast(toast)
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True)
+        except OSError as e:
+            toast.dismiss()
+            self.toast(f"Couldn't export the audio: {e}")
+            return
+        self.audio_export = proc
+
+        def progress():
+            for line in proc.stdout:
+                if line.startswith("out_time_us="):
+                    try:
+                        pct = min(99, int(int(line.split("=", 1)[1]) / 1e6 / total * 100))
+                    except ValueError:
+                        continue
+                    GLib.idle_add(toast.set_title, f"Exporting audio… {pct}%")
+            err = proc.stderr.read().strip()
+            code = proc.wait()
+            GLib.idle_add(finished, code, err)
+
+        def finished(code, err):
+            self.audio_export = None
+            toast.dismiss()
+            if code == 0 and target.exists():
+                self.toast(f"Audio saved: {target.name} ({datasize.fmt(target.stat().st_size)})", "Open",
+                           lambda: Gio.AppInfo.launch_default_for_uri(target.as_uri(), None))
+            else:
+                self.toast(f"Couldn't export the audio. {err.splitlines()[-1] if err else ''}".strip())
+            return False
+        threading.Thread(target=progress, daemon=True).start()
 
     def choose_export_file(self, ext, options):
         name = re.sub(r"[^\w\- ,.]+", "", meetings.title(self.out_dir)).strip() or "meeting"

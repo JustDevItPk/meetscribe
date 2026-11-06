@@ -305,3 +305,30 @@ def build_markdown(folder, messages, participants, summary=True, conversation=Fa
                 parts.append(f"**{m.group(1)}:{m.group(2)}:{m.group(3)} {m.group(4)}:** {m.group(5)}" if m else line)
                 parts.append("")
     return "\n".join(parts).rstrip() + "\n"
+
+
+# --- one mixed audio file ----------------------------------------------------
+AUDIO_FILES = (("audio-meeting.ogg", "meeting"), ("audio-mic.ogg", "mic"))
+
+
+def mixed_audio_command(folder, target):
+    """ffmpeg command that mixes a meeting's recordings into one clear MP3 for listening or sharing: your
+    mic's steady background noise is removed, quiet and loud voices on both sides are evened out, and the
+    result is limited so it never clips. The recordings themselves are left untouched.
+    Returns None when the meeting has no saved audio. Progress goes to stdout (-progress)."""
+    folder = pathlib.Path(folder)
+    inputs = [(folder / name, kind) for name, kind in AUDIO_FILES if (folder / name).exists()]
+    if not inputs:
+        return None
+    cmd = ["ffmpeg", "-v", "error", "-y", "-nostats", "-progress", "pipe:1"]
+    chains = []
+    for i, (path, kind) in enumerate(inputs):
+        cmd += ["-i", str(path)]
+        clean = "highpass=f=80,afftdn=nf=-30:nr=12:tn=1," if kind == "mic" else ""
+        chains.append(f"[{i}:a]{clean}dynaudnorm=f=250:g=15:m=8:p=0.9[a{i}]")
+    if len(inputs) == 2:
+        mix = ";".join(chains) + ";[a0][a1]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.89[out]"
+    else:
+        mix = chains[0].replace("[a0]", ",alimiter=limit=0.89[out]")
+    return cmd + ["-filter_complex", mix, "-map", "[out]", "-ac", "1", "-ar", "16000",
+                  "-c:a", "libmp3lame", "-b:a", "48k", str(target)]
