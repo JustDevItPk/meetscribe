@@ -22,3 +22,6 @@ MeetScribe/
 voices.json
 voice_clips.json
 speakers.json
+
+# Local agent worktrees
+.claude/
