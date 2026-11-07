@@ -1,4 +1,4 @@
-"""Storage overview: how much space each part of MeetScribe's data takes, the largest meetings, and
+"""Storage overview: how much space each part of MintoMeet's data takes, the largest meetings, and
 warnings when it's getting large, so you know when to clean up."""
 import gi
 
@@ -57,7 +57,7 @@ class StorageDialog(Adw.Dialog):
         t = o["totals"]
         page = Adw.PreferencesPage()
 
-        top = Adw.PreferencesGroup(title=f"MeetScribe uses {datasize.fmt(o['total'])} on this computer")
+        top = Adw.PreferencesGroup(title=f"MintoMeet uses {datasize.fmt(o['total'])} on this computer")
         if o["disk"]:
             d = o["disk"]
             used = d.total - d.free
@@ -104,7 +104,7 @@ class StorageDialog(Adw.Dialog):
         unused = sum(s for _, s in o["unused_models"])
         models = self.group("Speech models", t["models"],
                             "Downloaded once and reused by every meeting." +
-                            (f" {datasize.fmt(unused)} is in models MeetScribe doesn't use, which you can delete."
+                            (f" {datasize.fmt(unused)} is in models MintoMeet doesn't use, which you can delete."
                              if unused else ""), datasize.DATA / "models", "Open the models folder")
         for label, path, size, used in o["models"]:
             row = self.row(label, size, None if used else f"Safe to delete: {path}")
@@ -120,7 +120,7 @@ class StorageDialog(Adw.Dialog):
             cfg.add(self.row(label, size))
         page.add(cfg)
 
-        app = self.group("The app", t["app"], "Program files. They only change when MeetScribe is reinstalled.",
+        app = self.group("The app", t["app"], "Program files. They only change when MintoMeet is reinstalled.",
                          datasize.DATA, "Open the app folder")
         for label, _path, size in o["app"]:
             app.add(self.row(label, size))

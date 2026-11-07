@@ -38,13 +38,13 @@ A list of names and terms that speech recognition often gets wrong, such as prod
 
 Your own one-click requests next to the built-in suggestions, for example "Standup format: yesterday / today / blockers per person" or "Jira tickets from the action items".
 
-- **How:** a "Manage prompts…" list in the chat tab, saved in `~/.config/meetscribe/prompts.json`. The suggestion chips come from the built-in prompts plus yours.
+- **How:** a "Manage prompts…" list in the chat tab, saved in `~/.config/mintomeet/prompts.json`. The suggestion chips come from the built-in prompts plus yours.
 
 ## Global start/stop hotkey (M)
 
-Start or stop recording, or add a bookmark, from anywhere without opening MeetScribe.
+Start or stop recording, or add a bookmark, from anywhere without opening MintoMeet.
 
-- **How:** GNOME on Wayland doesn't let apps grab keys themselves. MeetScribe would instead register a GNOME custom shortcut through `gsettings` that runs `meetscribe --toggle` or `meetscribe --bookmark`. Those commands reach the running app through its existing app actions. OpenWhispr does the same thing on GNOME.
+- **How:** GNOME on Wayland doesn't let apps grab keys themselves. MintoMeet would instead register a GNOME custom shortcut through `gsettings` that runs `mintomeet --toggle` or `mintomeet --bookmark`. Those commands reach the running app through its existing app actions. OpenWhispr does the same thing on GNOME.
 - **Watch out for:** KDE and Hyprland need their own way of registering shortcuts.
 
 ## Storage cleanup (S)
@@ -58,7 +58,7 @@ Keep transcripts forever but delete audio older than a set number of days. Each 
 
 Real echo cancellation for when you're not on headphones, instead of today's after-the-fact duplicate-line filter.
 
-- **How:** route the microphone through PipeWire's built-in echo-cancel module (`libpipewire-module-echo-cancel`, WebRTC AEC) using the meeting audio as the reference. MeetScribe would load the module only while recording and record from its cleaned microphone.
+- **How:** route the microphone through PipeWire's built-in echo-cancel module (`libpipewire-module-echo-cancel`, WebRTC AEC) using the meeting audio as the reference. MintoMeet would load the module only while recording and record from its cleaned microphone.
 - **Watch out for:** this changes your system audio routing while recording, so it needs careful testing with Zoom and Lark. They run their own echo cancellation and may react badly to a second layer. It should be an opt-in option.
 
 ## Known limits of the current version

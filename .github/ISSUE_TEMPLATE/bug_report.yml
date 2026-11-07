@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Thanks for reporting! **Please don't attach real meeting recordings, transcripts or files from
-        `~/.config/meetscribe`**: they contain other people's voices and words. Security problems go through
+        `~/.config/mintomeet`**: they contain other people's voices and words. Security problems go through
         SECURITY.md instead.
   - type: textarea
     id: what
@@ -26,8 +26,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: MeetScribe version
-      description: Output of `meetscribe --version`
+      label: MintoMeet version
+      description: Output of `mintomeet --version`
     validations:
       required: true
   - type: input

@@ -1,4 +1,4 @@
-"""How much disk space MeetScribe's data takes: each meeting (split into audio, transcripts, earlier
+"""How much disk space MintoMeet's data takes: each meeting (split into audio, transcripts, earlier
 versions, chat), the speech models, learned voices and settings, and the app itself.
 
 Pure Python (no GTK) so it can be tested on its own. Sizes are what the files take on disk.
@@ -8,8 +8,8 @@ import pathlib
 import shutil
 import time
 
-DATA = pathlib.Path.home() / ".local/share/meetscribe"
-CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
+DATA = pathlib.Path.home() / ".local/share/mintomeet"
+CONFIG_DIR = pathlib.Path(os.environ.get("MINTOMEET_CONFIG_DIR", pathlib.Path.home() / ".config/mintomeet"))
 HF_HUB = pathlib.Path(os.environ.get("HF_HUB_CACHE") or
                       pathlib.Path(os.environ.get("HF_HOME", pathlib.Path.home() / ".cache/huggingface")) / "hub")
 
@@ -20,8 +20,6 @@ WARN_FREE_FRACTION = 0.10
 
 MEETING_PARTS = [("audio", "Audio recordings"), ("transcript", "Transcripts"),
                  ("versions", "Earlier transcripts"), ("chat", "Chat"), ("other", "Other files")]
-WHISPER_REPOS = {"models--Systran--faster-whisper-small": "Whisper small",
-                 "models--Systran--faster-whisper-medium": "Whisper medium"}
 STATIC_TTL = 600                # seconds to reuse model/app sizes (they rarely change)
 _static = {"at": 0.0, "value": None}
 
@@ -107,7 +105,7 @@ def hf_repo(path):
 
 
 def models():
-    """[(label, path, bytes, used_by_meetscribe)] for every speech model on disk."""
+    """[(label, path, bytes, used_by_mintomeet)] for every speech model on disk."""
     out = []
     mdir = DATA / "models"
     if mdir.is_dir():
@@ -119,23 +117,16 @@ def models():
             else:
                 label = e.name
             out.append((label, e, tree(e), True))
+    import modelcatalog     # lazy: modelcatalog uses this module for sizes
+    names = {"models--" + m.repo.replace("/", "--"): m.name for m in modelcatalog.MODELS if m.repo}
     if HF_HUB.is_dir():
         for e in sorted(HF_HUB.iterdir()):
             if not e.name.startswith("models--") or "whisper" not in e.name.lower():
                 continue
-            label = WHISPER_REPOS.get(e.name)
+            label = names.get(e.name)
             pretty = e.name.split("--")[-1]
-            out.append((label or f"{pretty} (not used by MeetScribe)", e, hf_repo(e), label is not None))
+            out.append((label or f"{pretty} (not used by MintoMeet)", e, hf_repo(e), label is not None))
     return out
-
-
-def engine_size(engine, model):
-    """Bytes on disk for a transcription choice in the settings, or 0 if not downloaded."""
-    for label, _path, size, used in _static_parts()["models"]:
-        if used and ((engine == "parakeet" and label == "Parakeet") or
-                     (engine == "whisper" and label == f"Whisper {model}")):
-            return size
-    return 0
 
 
 def app_parts():
@@ -150,8 +141,13 @@ def app_parts():
                 out.append((names[e.name], e, tree(e)))
             else:
                 code += tree(e)
-    out.append(("MeetScribe itself", DATA, code))
+    out.append(("MintoMeet itself", DATA, code))
     return sorted(out, key=lambda x: -x[2])
+
+
+def invalidate():
+    """Forget the cached model/app sizes (after a model is downloaded or deleted)."""
+    _static["value"] = None
 
 
 def _static_parts(force=False):

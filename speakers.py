@@ -12,7 +12,7 @@ from gi.repository import Adw, Gtk  # noqa: E402
 
 import voices  # noqa: E402
 
-CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
+CONFIG_DIR = pathlib.Path(os.environ.get("MINTOMEET_CONFIG_DIR", pathlib.Path.home() / ".config/mintomeet"))
 FILE = CONFIG_DIR / "speakers.json"
 RESERVED = {"you", "them", "audio"}
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -38,7 +38,7 @@ def validate(name, email, speakers):
     if any(c in name for c in ":[]") or "  " in name:
         return "Names can't contain : [ ] or double spaces."
     if name.lower() in RESERVED:
-        return f"“{name}” is used by MeetScribe itself. Pick another name."
+        return f"“{name}” is used by MintoMeet itself. Pick another name."
     if any(s["name"].lower() == name.lower() for s in speakers):
         return f"“{name}” is already in the list."
     if email and not EMAIL_RE.match(email):
@@ -64,7 +64,7 @@ class SpeakersDialog(Adw.Dialog):
         add_group = Adw.PreferencesGroup(
             title="Add a speaker",
             description="People you add here can be picked for any line of any meeting. Once you pick someone, "
-                        "MeetScribe learns their voice and names them automatically next time. Emails are "
+                        "MintoMeet learns their voice and names them automatically next time. Emails are "
                         "optional; the agent uses them when you ask it to write follow-up emails.")
         self.name_row = Adw.EntryRow(title="Name")
         self.email_row = Adw.EntryRow(title="Email (optional)")

@@ -13,7 +13,7 @@ import math
 import os
 import pathlib
 
-CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
+CONFIG_DIR = pathlib.Path(os.environ.get("MINTOMEET_CONFIG_DIR", pathlib.Path.home() / ".config/mintomeet"))
 FILE = CONFIG_DIR / "voices.json"
 MATCH = 0.50        # cosine similarity needed to recognise a known voice
 MARGIN = 0.05       # ...and how much better than the second-best profile it must be

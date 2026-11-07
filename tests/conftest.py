@@ -9,7 +9,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 @pytest.fixture
 def voice_store(tmp_path, monkeypatch):
-    """voices.py writing to a temporary config folder instead of ~/.config/meetscribe."""
+    """voices.py writing to a temporary config folder instead of ~/.config/mintomeet."""
     import voices
     monkeypatch.setattr(voices, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(voices, "FILE", tmp_path / "voices.json")

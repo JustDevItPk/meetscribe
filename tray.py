@@ -68,7 +68,7 @@ class Tray:
 
     def __init__(self, on_activate, items):
         self.on_activate, self.items = on_activate, items
-        self.icon, self.title = "audio-input-microphone-symbolic", "MeetScribe"
+        self.icon, self.title = "audio-input-microphone-symbolic", "MintoMeet"
         self.revision = 1
         self.callbacks = {}
         self.ok = False
@@ -92,7 +92,7 @@ class Tray:
     # --- public ----------------------------------------------------------
     def update(self, recording):
         self.icon = "media-record-symbolic" if recording else "audio-input-microphone-symbolic"
-        self.title = "MeetScribe - recording" if recording else "MeetScribe"
+        self.title = "MintoMeet - recording" if recording else "MintoMeet"
         for sig in ("NewIcon", "NewTitle", "NewToolTip"):
             self._emit(ITEM_PATH, "org.kde.StatusNotifierItem", sig, None)
         self.refresh_menu()
@@ -110,7 +110,7 @@ class Tray:
 
     def _item_prop(self, _conn, _sender, _path, _iface, prop):
         values = {
-            "Category": GLib.Variant("s", "ApplicationStatus"), "Id": GLib.Variant("s", "meetscribe"),
+            "Category": GLib.Variant("s", "ApplicationStatus"), "Id": GLib.Variant("s", "mintomeet"),
             "Title": GLib.Variant("s", self.title), "Status": GLib.Variant("s", "Active"),
             "IconName": GLib.Variant("s", self.icon), "IconThemePath": GLib.Variant("s", ""),
             "ItemIsMenu": GLib.Variant("b", False), "Menu": GLib.Variant("o", MENU_PATH),

@@ -13,10 +13,13 @@ LEGACY_RE = re.compile(r"^transcript\.before-(\w+)-(\d{8}-\d{6})\.txt$")    # ba
 MODEL_NAMES = {
     "parakeet": "Parakeet TDT 0.6B v3",
     "whisper": "Whisper",               # older meetings didn't record the Whisper size
+    "whisper-tiny": "Whisper tiny",
+    "whisper-base": "Whisper base",
     "whisper-small": "Whisper small",
     "whisper-medium": "Whisper medium",
     "whisper-large-v3": "Whisper large-v3",
     "whisper-large-v3-turbo": "Whisper large-v3 turbo",
+    "whisper-distil-large-v3": "Distil-Whisper large-v3",
 }
 
 
@@ -294,7 +297,7 @@ def build_markdown(folder, messages, participants, summary=True, conversation=Fa
     if conversation and messages:
         parts += ["## Ask Agent conversation", ""]
         for m in messages:
-            who = "**You:**" if m["role"] == "user" else "**Agent:**"
+            who = "**You:**" if m["role"] == "user" else f"**{m.get('agent') or 'Agent'}:**"
             parts += [who, "", demote(m["text"]), ""]
     if transcript:
         path = transcript_file(folder)
