@@ -19,7 +19,7 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
       - name: shellcheck
-        run: shellcheck install.sh uninstall.sh meetscribe
+        run: shellcheck install.sh uninstall.sh mintomeet
 
   test:
     runs-on: ubuntu-latest

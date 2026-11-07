@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize a meeting folder from the terminal: meetscribe summarize FOLDER (uses the AI agent chosen in the app)."""
+"""Summarize a meeting folder from the terminal: mintomeet summarize FOLDER (uses the AI agent chosen in the app)."""
 import sys
 import threading
 
@@ -16,7 +16,7 @@ def main():
     cfg = agents.load_config()
     issue = chat.agent_problem(cfg)
     if issue:
-        sys.exit(f"{issue} Choose an AI agent in MeetScribe (Preferences → AI agent).")
+        sys.exit(f"{issue} Choose an AI agent in MintoMeet (Preferences → AI agent).")
     print(f"Asking {agents.describe(cfg)}…\n", file=sys.stderr)
     done = threading.Event()
     result = {}

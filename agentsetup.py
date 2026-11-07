@@ -40,7 +40,7 @@ class AgentDialog(Adw.Dialog):
 
         pick = Adw.PreferencesGroup(
             title="Which AI answers your questions?",
-            description="When you ask about a meeting, MeetScribe sends that meeting's transcript text (never the "
+            description="When you ask about a meeting, MintoMeet sends that meeting's transcript text (never the "
                         "audio) to the agent you choose. Agents on this computer keep everything on it.")
         self.service_ids = [s[0] for s in agents.SERVICES]
         self.service_row = Adw.ComboRow(title="Service", model=Gtk.StringList.new([s[1] for s in agents.SERVICES]),

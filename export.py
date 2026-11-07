@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Turn MeetScribe's export Markdown into a Word (.docx) or PDF file.
+"""Turn MintoMeet's export Markdown into a Word (.docx) or PDF file.
 
-Runs in MeetScribe's own Python (needs python-docx and fpdf2): export.py INPUT.md OUTPUT.docx|OUTPUT.pdf
+Runs in MintoMeet's own Python (needs python-docx and fpdf2): export.py INPUT.md OUTPUT.docx|OUTPUT.pdf
 Understands the small Markdown subset the app writes: # headings, - bullets, **bold**, *italic*, paragraphs.
 """
 import pathlib

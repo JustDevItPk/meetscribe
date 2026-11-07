@@ -22,10 +22,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
+CONFIG_DIR = pathlib.Path(os.environ.get("MINTOMEET_CONFIG_DIR", pathlib.Path.home() / ".config/mintomeet"))
 
 SYSTEM = (
-    "You are the meeting assistant inside MeetScribe, a desktop app. The user's meeting transcript is below. "
+    "You are the meeting assistant inside MintoMeet, a desktop app. The user's meeting transcript is below. "
     "'Them' is the meeting audio (the other participants, possibly several people) and 'You' is the user's own "
     "microphone. The transcript comes from speech recognition, so expect misheard words and names; when something "
     "is unclear, say so instead of guessing. Base answers on the transcript; you may also help with writing tasks "
@@ -190,13 +190,13 @@ def problem(cfg, key=""):
 # --- talking to the services -------------------------------------------------------------------------------
 def _headers(cfg, key):
     k = kind(cfg)
-    h = {"Content-Type": "application/json", "User-Agent": "MeetScribe"}
+    h = {"Content-Type": "application/json", "User-Agent": "MintoMeet"}
     if k == "anthropic":
         h.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
     elif key:
         h["Authorization"] = f"Bearer {key}"
     if cfg.get("service") == "openrouter":
-        h["X-Title"] = "MeetScribe"
+        h["X-Title"] = "MintoMeet"
     return h
 
 

@@ -110,7 +110,7 @@ def test_datasize_labels_catalog_models_as_used(hub, monkeypatch):
     monkeypatch.setattr(datasize, "HF_HUB", root)
     monkeypatch.setattr(datasize, "DATA", root.parent / "nothing")
     labels = {label: used for label, _p, _s, used in datasize.models()}
-    assert labels == {"Whisper base": True, "faster-whisper-other (not used by MeetScribe)": False}
+    assert labels == {"Whisper base": True, "faster-whisper-other (not used by MintoMeet)": False}
 
 
 def test_detect_reads_this_computer():

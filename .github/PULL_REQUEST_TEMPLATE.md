@@ -9,7 +9,7 @@
 
 ## Checklist
 
-- [ ] `python3 -m pytest`, `ruff check .` and `shellcheck *.sh meetscribe` pass
+- [ ] `python3 -m pytest`, `ruff check .` and `shellcheck *.sh mintomeet` pass
 - [ ] New modules are listed in `FILES` in `install.sh`
 - [ ] User-facing text is plain and says what will happen
 - [ ] Added a line to `CHANGELOG.md` under *Unreleased*

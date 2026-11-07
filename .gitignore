@@ -15,7 +15,7 @@ venv/
 .DS_Store
 
 # Never commit real meetings or voice data
-MeetScribe/
+MintoMeet/
 *.ogg
 *.wav
 *.mp3

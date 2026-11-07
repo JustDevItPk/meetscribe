@@ -75,7 +75,7 @@ class VoiceReviewDialog(Adw.Dialog):
     def fill_list(self):
         prefs = Adw.PreferencesPage()
         group = Adw.PreferencesGroup(
-            title="Voices MeetScribe recognises",
+            title="Voices MintoMeet recognises",
             description="Each voice is learned from the lines you named that person on. Open someone to listen "
                         "to those clips and remove any that are someone else, noise or too short to tell. "
                         "Recognition uses what's left, from the next recording on.")

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Installs (or updates) MeetScribe for the current user, no sudo needed:
-#   - a private Python 3.12 with the speech engines under ~/.local/share/meetscribe
-#   - the `meetscribe` command in ~/.local/bin and an entry in your app menu
+# Installs (or updates) MintoMeet for the current user, no sudo needed:
+#   - a private Python 3.12 with the speech engines under ~/.local/share/mintomeet
+#   - the `mintomeet` command in ~/.local/bin and an entry in your app menu
 #   - the Parakeet and speaker-recognition models (about 680 MB, downloaded once)
 # Run it again after pulling new code to update. Remove everything with ./uninstall.sh.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-dest="$HOME/.local/share/meetscribe"
-FILES=(worker gui chat speakers voices voicereview datasize storage meetings modelcatalog modellibrary procstats tray callwatch export summarize version agents agentkeys agentsetup)
+dest="$HOME/.local/share/mintomeet"
+FILES=(worker gui chat speakers voices voicereview datasize storage meetings modelcatalog modellibrary procstats tray callwatch export summarize version agents agentkeys agentsetup migrate)
 
 hint() {
   if command -v apt >/dev/null; then echo "  sudo apt install $1"
@@ -31,7 +31,7 @@ from gi.repository import Adw
 sys.exit(0 if (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 6) else 1)
 PY
 then
-  echo "MeetScribe needs GTK 4 and libadwaita 1.6 or newer for Python (Ubuntu 25.04+, Fedora 41+, Debian 13+)."
+  echo "MintoMeet needs GTK 4 and libadwaita 1.6 or newer for Python (Ubuntu 25.04+, Fedora 41+, Debian 13+)."
   hint "python3-gi gir1.2-gtk-4.0 gir1.2-adw-1" "python3-gobject gtk4 libadwaita" "python-gobject gtk4 libadwaita"
   exit 1
 fi
@@ -39,8 +39,31 @@ fi
 case "$(uname -m)" in
   x86_64) arch=x86_64 ;;
   aarch64|arm64) arch=aarch64 ;;
-  *) echo "Unsupported processor: $(uname -m). MeetScribe runs on x86_64 and ARM64 Linux."; exit 1 ;;
+  *) echo "Unsupported processor: $(uname -m). MintoMeet runs on x86_64 and ARM64 Linux."; exit 1 ;;
 esac
+
+# Upgrading from MeetScribe (this app's former name): keep the downloaded models and tools, move the meetings
+# and settings (migrate.py), and replace the old command, menu entry and log-in entry.
+old="$HOME/.local/share/meetscribe"
+if [ -d "$old" ] || [ -d "$HOME/MeetScribe" ] || [ -d "$HOME/.config/meetscribe" ]; then
+  if pgrep -f "meetscribe/(gui|worker)\.py" >/dev/null; then
+    echo "MeetScribe (this app's former name) is running. Quit it from its tray menu (and finish any recording), then run ./install.sh again."
+    exit 1
+  fi
+  if [ -d "$old" ] && [ ! -e "$dest" ]; then
+    mkdir -p "$dest"
+    for keep in models uv; do
+      if [ -d "$old/$keep" ]; then mv "$old/$keep" "$dest/$keep"; fi
+    done
+    rm -rf "$old"
+    echo "Moved MeetScribe's speech models to $dest."
+  fi
+  /usr/bin/python3 "$here/migrate.py"
+fi
+had_autostart=0
+[ -f "$HOME/.config/autostart/dev.meetscribe.app.desktop" ] && had_autostart=1
+rm -f "$HOME/.local/bin/meetscribe" "$HOME/.local/share/applications/dev.meetscribe.app.desktop" \
+      "$HOME/.local/share/applications/meetscribe.desktop" "$HOME/.config/autostart/dev.meetscribe.app.desktop"
 
 mkdir -p "$dest/uv" "$HOME/.local/bin" "$HOME/.local/share/applications"
 
@@ -61,19 +84,23 @@ export UV_PYTHON_INSTALL_DIR="$dest/python"
 "$dest/uv/uv" pip install --python "$dest/venv/bin/python" -r "$here/requirements.txt"
 
 for f in "${FILES[@]}"; do cp "$here/$f.py" "$dest/"; done
-cp "$here/meetscribe" "$dest/"
+cp "$here/mintomeet" "$dest/"
 "$dest/venv/bin/python" "$dest/worker.py" --prepare
-chmod +x "$dest/meetscribe"
-ln -sf "$dest/meetscribe" "$HOME/.local/bin/meetscribe"
-rm -f "$HOME/.local/share/applications/meetscribe.desktop"    # renamed: notifications need the app id as the file name
-cat > "$HOME/.local/share/applications/dev.meetscribe.app.desktop" <<DESKTOP
+chmod +x "$dest/mintomeet"
+ln -sf "$dest/mintomeet" "$HOME/.local/bin/mintomeet"
+cat > "$HOME/.local/share/applications/dev.mintomeet.app.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=MeetScribe
+Name=MintoMeet
 Comment=Record and transcribe meeting audio locally
-Exec=$dest/meetscribe
+Exec=$dest/mintomeet
 Icon=audio-input-microphone
 Terminal=false
 Categories=AudioVideo;Audio;
 DESKTOP
-echo "Installed MeetScribe $("$dest/meetscribe" --version | cut -d' ' -f2). Open it from the app menu, or run: meetscribe"
+if [ "$had_autostart" = 1 ]; then
+  mkdir -p "$HOME/.config/autostart"
+  printf '[Desktop Entry]\nType=Application\nName=MintoMeet\nExec=%s --background\nIcon=audio-input-microphone\nX-GNOME-Autostart-enabled=true\nNoDisplay=false\n' \
+    "$dest/mintomeet" > "$HOME/.config/autostart/dev.mintomeet.app.desktop"
+fi
+echo "Installed MintoMeet $("$dest/mintomeet" --version | cut -d' ' -f2). Open it from the app menu, or run: mintomeet"

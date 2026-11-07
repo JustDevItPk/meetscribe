@@ -1,5 +1,5 @@
 """API keys for AI agents: kept in your desktop's keyring (GNOME Keyring / KWallet, via libsecret) when it is
-available, otherwise in ~/.config/meetscribe/api-keys.json, readable by you only. Never in settings.json, never
+available, otherwise in ~/.config/mintomeet/api-keys.json, readable by you only. Never in settings.json, never
 logged.
 
 Keys are stored per agents.account(cfg), e.g. "openai:https://api.openai.com/v1".
@@ -8,25 +8,29 @@ import json
 import os
 import pathlib
 
-CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
-LABEL = "MeetScribe API key"
+CONFIG_DIR = pathlib.Path(os.environ.get("MINTOMEET_CONFIG_DIR", pathlib.Path.home() / ".config/mintomeet"))
+LABEL = "MintoMeet API key"
+OLD_SCHEMA = "dev.meetscribe.ApiKey"     # keys saved before the app was renamed from MeetScribe
 _schema = None
+_old_schema = None
 _secret = None
 
 
 def _keyring():
-    """libsecret, or None when it isn't installed or no keyring service is running (set MEETSCRIBE_NO_KEYRING=1
+    """libsecret, or None when it isn't installed or no keyring service is running (set MINTOMEET_NO_KEYRING=1
     to always use the file)."""
-    global _schema, _secret
-    if os.environ.get("MEETSCRIBE_NO_KEYRING"):
+    global _schema, _old_schema, _secret
+    if os.environ.get("MINTOMEET_NO_KEYRING"):
         return None
     if _secret is None:
         try:
             import gi
             gi.require_version("Secret", "1")
             from gi.repository import Secret
-            _schema = Secret.Schema.new("dev.meetscribe.ApiKey", Secret.SchemaFlags.NONE,
+            _schema = Secret.Schema.new("dev.mintomeet.ApiKey", Secret.SchemaFlags.NONE,
                                         {"account": Secret.SchemaAttributeType.STRING})
+            _old_schema = Secret.Schema.new(OLD_SCHEMA, Secret.SchemaFlags.NONE,
+                                            {"account": Secret.SchemaAttributeType.STRING})
             _secret = Secret
         except (ImportError, ValueError, AttributeError):
             _secret = False
@@ -64,6 +68,11 @@ def get(account):
             value = secret.password_lookup_sync(_schema, {"account": account}, None)
             if value:
                 return value
+            value = secret.password_lookup_sync(_old_schema, {"account": account}, None)
+            if value:       # saved under the old name: move it over
+                if put(account, value) == "keyring":
+                    secret.password_clear_sync(_old_schema, {"account": account}, None)
+                return value
         except Exception:  # noqa: BLE001 - keyring locked or not running: fall back to the file
             pass
     return _read_file().get(account, "")
@@ -97,6 +106,7 @@ def forget(account):
     if secret is not None:
         try:
             secret.password_clear_sync(_schema, {"account": account}, None)
+            secret.password_clear_sync(_old_schema, {"account": account}, None)
         except Exception:  # noqa: BLE001
             pass
     data = _read_file()

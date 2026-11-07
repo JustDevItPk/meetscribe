@@ -1,4 +1,4 @@
-"""The speech models MeetScribe can use: what each needs, how well it would run on this computer, and
+"""The speech models MintoMeet can use: what each needs, how well it would run on this computer, and
 whether it's downloaded.
 
 Pure Python (no GTK, no speech libraries) so both the window and the recorder can use it. Downloading
@@ -14,7 +14,7 @@ import pathlib
 import shutil
 from dataclasses import dataclass
 
-DATA = pathlib.Path.home() / ".local/share/meetscribe"
+DATA = pathlib.Path.home() / ".local/share/mintomeet"
 MODELS_DIR = DATA / "models"
 HF_HUB = pathlib.Path(os.environ.get("HF_HUB_CACHE") or
                       pathlib.Path(os.environ.get("HF_HOME", pathlib.Path.home() / ".cache/huggingface")) / "hub")

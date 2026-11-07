@@ -1,4 +1,4 @@
-"""How much disk space MeetScribe's data takes: each meeting (split into audio, transcripts, earlier
+"""How much disk space MintoMeet's data takes: each meeting (split into audio, transcripts, earlier
 versions, chat), the speech models, learned voices and settings, and the app itself.
 
 Pure Python (no GTK) so it can be tested on its own. Sizes are what the files take on disk.
@@ -8,8 +8,8 @@ import pathlib
 import shutil
 import time
 
-DATA = pathlib.Path.home() / ".local/share/meetscribe"
-CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
+DATA = pathlib.Path.home() / ".local/share/mintomeet"
+CONFIG_DIR = pathlib.Path(os.environ.get("MINTOMEET_CONFIG_DIR", pathlib.Path.home() / ".config/mintomeet"))
 HF_HUB = pathlib.Path(os.environ.get("HF_HUB_CACHE") or
                       pathlib.Path(os.environ.get("HF_HOME", pathlib.Path.home() / ".cache/huggingface")) / "hub")
 
@@ -105,7 +105,7 @@ def hf_repo(path):
 
 
 def models():
-    """[(label, path, bytes, used_by_meetscribe)] for every speech model on disk."""
+    """[(label, path, bytes, used_by_mintomeet)] for every speech model on disk."""
     out = []
     mdir = DATA / "models"
     if mdir.is_dir():
@@ -125,7 +125,7 @@ def models():
                 continue
             label = names.get(e.name)
             pretty = e.name.split("--")[-1]
-            out.append((label or f"{pretty} (not used by MeetScribe)", e, hf_repo(e), label is not None))
+            out.append((label or f"{pretty} (not used by MintoMeet)", e, hf_repo(e), label is not None))
     return out
 
 
@@ -141,7 +141,7 @@ def app_parts():
                 out.append((names[e.name], e, tree(e)))
             else:
                 code += tree(e)
-    out.append(("MeetScribe itself", DATA, code))
+    out.append(("MintoMeet itself", DATA, code))
     return sorted(out, key=lambda x: -x[2])
 
 

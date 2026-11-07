@@ -47,7 +47,7 @@ END_SILENCE = 7         # quiet frames that close a chunk
 MIN_CHUNK = 2.0         # seconds
 MAX_CHUNK = 25.0        # seconds
 
-DATA = pathlib.Path.home() / ".local/share/meetscribe"
+DATA = pathlib.Path.home() / ".local/share/mintomeet"
 PARAKEET_NAME = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 PARAKEET_URL = f"https://huggingface.co/csukuangfj/{PARAKEET_NAME}/resolve/main"
 PARAKEET_FILES = ["tokens.txt", "decoder.int8.onnx", "joiner.int8.onnx", "encoder.int8.onnx"]
@@ -409,7 +409,7 @@ class Stream(threading.Thread):
             return self.source
         self.device = self.source()
         return ["parec", "--device", self.device, "--format=s16le", f"--rate={RATE}", "--channels=1",
-                "--latency-msec=100", "--client-name=meetscribe"]
+                "--latency-msec=100", "--client-name=mintomeet"]
 
     def emit(self, frames, start):
         with self.stats.lock:
@@ -518,7 +518,7 @@ def clean(segs):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", help="output folder (default ~/MeetScribe/<timestamp>)")
+    ap.add_argument("--out", help="output folder (default ~/MintoMeet/<timestamp>)")
     ap.add_argument("--engine", choices=["parakeet", "whisper"], default="parakeet")
     ap.add_argument("--model", default="small",
                     help="Whisper model: " + ", ".join(m.model for m in modelcatalog.MODELS if m.engine == "whisper"))
@@ -566,7 +566,7 @@ def main():
     else:
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
         name = pathlib.Path(args.file).stem + "_" if args.file else ""
-        out = pathlib.Path.home() / "MeetScribe" / (name + stamp)
+        out = pathlib.Path.home() / "MintoMeet" / (name + stamp)
     out.mkdir(parents=True, exist_ok=True)
     try:
         out.chmod(0o700)            # recordings are personal: readable by you only

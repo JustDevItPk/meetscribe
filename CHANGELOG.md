@@ -1,16 +1,16 @@
 # Changelog
 
-All notable changes to MeetScribe are listed here. The format follows
+All notable changes to MintoMeet are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
 ### Added
-- **Choose your AI agent.** Ask Agent and `meetscribe summarize` can use Claude Code (still the default), OpenAI,
+- **Choose your AI agent.** Ask Agent and `mintomeet summarize` can use Claude Code (still the default), OpenAI,
   the Anthropic API, Google Gemini, OpenRouter, Groq, Mistral, Together AI, Ollama or LM Studio on your own
   computer, or any OpenAI-compatible server. A new *AI agent* window (Preferences, or *Change…* in Ask Agent)
   lists each service's models, tests the connection and says where your transcript goes.
-- If no agent is ready when you ask a question, MeetScribe opens the AI agent window and sends your question once
+- If no agent is ready when you ask a question, MintoMeet opens the AI agent window and sends your question once
   it's set up.
 - Answers are labelled with the model that gave them, also in `chat.md` and exports; you can switch agents in the
   middle of a chat and the new one sees the conversation so far.
@@ -27,6 +27,10 @@ All notable changes to MeetScribe are listed here. The format follows
 - `worker.py --download <model id>` for scripted downloads.
 
 ### Changed
+- **MeetScribe is now MintoMeet.** The command is `mintomeet`, meetings live in `~/MintoMeet`, settings in
+  `~/.config/mintomeet` and the app in `~/.local/share/mintomeet`. Running `./install.sh` (or starting the app)
+  moves everything from the old places, including downloaded models, saved API keys, the log-in entry and Ask
+  Agent's Claude Code sessions; nothing needs downloading again.
 - Recording settings, *Transcribe again* and the live model switcher list only the models on this computer; if
   the chosen model is deleted, new meetings fall back to Parakeet. *Transcribe again* suggests your most accurate
   model and estimates the time for this computer.
@@ -64,7 +68,7 @@ First public release.
 - Tray icon, start at log-in, and a prompt when a call app starts using the microphone.
 - Meeting and settings folders are readable by your user only.
 - `install.sh` checks for libadwaita 1.6+, supports x86_64 and ARM64, and installs pinned engine versions;
-  new `uninstall.sh`; `meetscribe --version` and an About window.
+  new `uninstall.sh`; `mintomeet --version` and an About window.
 
-[Unreleased]: https://github.com/JustDevItPk/meetscribe/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/JustDevItPk/meetscribe/releases/tag/v0.1.0
+[Unreleased]: https://github.com/JustDevItPk/mintomeet/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/JustDevItPk/mintomeet/releases/tag/v0.1.0

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# MintoMeet launcher.
+#   mintomeet                    open the window (--background: start hidden in the tray)
+#   mintomeet record [options]   record from the terminal (Ctrl+C to stop); see `mintomeet record --help`
+#   mintomeet file AUDIO [opts]  transcribe an existing audio/video file
+#   mintomeet summarize FOLDER   summarize a meeting folder with Claude
+#   mintomeet --version          print the version
+set -euo pipefail
+d="$HOME/.local/share/mintomeet"
+case "${1:-gui}" in
+  gui|--background) exec /usr/bin/python3 "$d/gui.py" "$@" ;;
+  record) shift; exec "$d/venv/bin/python" "$d/worker.py" "$@" ;;
+  file) shift; f="${1:?usage: mintomeet file AUDIO [options]}"; shift; exec "$d/venv/bin/python" "$d/worker.py" --file "$f" "$@" ;;
+  summarize) exec /usr/bin/python3 "$d/summarize.py" "${2:?usage: mintomeet summarize FOLDER}" ;;
+  --version|version) exec /usr/bin/python3 -c "import sys; sys.path.insert(0, '$d'); import version; print('MintoMeet', version.__version__)" ;;
+  -h|--help|help) sed -n '2,7p' "$0" ;;
+  *) sed -n '2,7p' "$0"; exit 1 ;;
+esac

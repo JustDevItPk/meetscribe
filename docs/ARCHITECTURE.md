@@ -1,4 +1,4 @@
-# How MeetScribe works
+# How MintoMeet works
 
 A short map of the code for contributors. Every module starts with a docstring that explains it in more
 detail.
@@ -18,11 +18,12 @@ detail.
 │   ├─ agents.py       AI agents: settings, OpenAI / Anthropic / Ollama streaming   │
 │   ├─ agentkeys.py    API keys in the desktop keyring (or a 0600 file)              │
 │   ├─ agentsetup.py   "AI agent" window: choose, connect, test                      │
-│   └─ procstats.py    CPU / memory of the recorder, read from /proc                │
+│   ├─ procstats.py    CPU / memory of the recorder, read from /proc                │
+│   └─ migrate.py      moves data left by MeetScribe, the former name               │
 └───────────────┬──────────────────────────────────────────────────────────────────┘
        stdin:   │ ENGINE whisper medium en          ▲ stdout: one message per line
                 ▼                                   │
-┌──────────── MeetScribe's own Python 3.12 (~/.local/share/meetscribe/venv) ───────┐
+┌──────────── MintoMeet's own Python 3.12 (~/.local/share/mintomeet/venv) ─────────┐
 │ worker.py  capture (parec) → speech chunks → Parakeet / Whisper → speaker voices │
 │ export.py  Word / PDF export (python-docx, fpdf2)                                │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -35,7 +36,7 @@ onnxruntime and CTranslate2 wheels, which the installer puts in a private Python
 system packages. Modules used by both sides (`meetings.py`, `voices.py`, `modelcatalog.py`) must stay **pure Python** with no
 third-party imports.
 
-`install.sh` copies the `.py` files into `~/.local/share/meetscribe/`; the app runs from there, not from the
+`install.sh` copies the `.py` files into `~/.local/share/mintomeet/`; the app runs from there, not from the
 clone. **A new module must be added to the `FILES` list in `install.sh`.**
 
 ## The recorder protocol
@@ -77,7 +78,7 @@ files.
 ## A meeting folder
 
 ```
-~/MeetScribe/2026-11-03_100000/
+~/MintoMeet/2026-11-03_100000/
   meeting.json              title, start time, duration, model ("parakeet+whisper-medium" if switched)
   audio-meeting.ogg         what you heard (Opus 24 kbps)
   audio-mic.ogg             your microphone (Opus 16 kbps, speech mode)
@@ -94,11 +95,11 @@ files.
 `modelcatalog.py` (pure Python, shared) lists every supported model: engine, languages, download size, memory
 needed, reference speed, accuracy and license. It also reads this computer's specs from `/proc`, estimates each
 model's live speed from its cores, gives a fit verdict, and knows where each model lives on disk: Parakeet in
-`~/.local/share/meetscribe/models/`, Whisper in the Hugging Face cache (`~/.cache/huggingface/hub`, or
+`~/.local/share/mintomeet/models/`, Whisper in the Hugging Face cache (`~/.cache/huggingface/hub`, or
 `$HF_HUB_CACHE`). Settings store the chosen model's id (`"model": "whisper-small"`).
 
 `modellibrary.py` is the *Speech models* dialog plus a small download manager owned by the window, so a download
-keeps going when the dialog is closed. Downloading runs `worker.py --download <id>` in MeetScribe's own Python,
+keeps going when the dialog is closed. Downloading runs `worker.py --download <id>` in MintoMeet's own Python,
 which prints `STATE: downloading pct=N` and then `DONE: <id>` or `ERROR: …`; cancelling stops it and deletes the
 half-finished files. Deleting (`modelcatalog.delete`) only removes that model's folder, plus shared Hugging Face
 blobs nothing else links to.
@@ -131,7 +132,7 @@ no model) it opens the AI agent window and sends the question once that is saved
 
 ## Learned voices
 
-`~/.config/meetscribe/voices.json` holds one averaged voiceprint per person, which is all the recorder reads.
+`~/.config/mintomeet/voices.json` holds one averaged voiceprint per person, which is all the recorder reads.
 `voice_clips.json` keeps the clips each profile was built from (meeting, stream, time, words, voiceprint).
 Naming a line adds its clip (and removes that moment from anyone else); removing clips in *Learned voices*
 rebuilds the profile from what's left. `voices.migrate()` once rebuilt clip lists for profiles learned before
@@ -143,7 +144,7 @@ clips were kept.
   anywhere with pytest. `tests/mockagents.py` is a local server that answers like OpenAI, Anthropic and Ollama,
   and `tests/test_chat.py` puts a fake `claude` command on `PATH`, so no real keys or subscription are used. See [CONTRIBUTING.md](../CONTRIBUTING.md).
 - The window can be driven without a real call: create `gui.Window` inside an `Adw.Application` with
-  `MEETSCRIBE_CONFIG_DIR` and `MEETSCRIBE_MEETINGS_DIR` pointing at temporary folders, call its methods from
+  `MINTOMEET_CONFIG_DIR` and `MINTOMEET_MEETINGS_DIR` pointing at temporary folders, call its methods from
   `GLib.timeout_add`, and render screenshots with `Gtk.WidgetPaintable`. Under Xvfb, real clicks and keys can
   be sent with XTest.
 - The recorder can be fed from a file instead of a microphone by replacing `Stream.command` with an

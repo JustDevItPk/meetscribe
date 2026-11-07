@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MeetScribe: record meetings, transcribe them locally, tell speakers apart and chat with an agent about them."""
+"""MintoMeet: record meetings, transcribe them locally, tell speakers apart and chat with an agent about them."""
 import datetime
 import json
 import math
@@ -26,6 +26,7 @@ import agentsetup  # noqa: E402
 import chat  # noqa: E402
 import datasize  # noqa: E402
 import meetings  # noqa: E402
+import migrate  # noqa: E402
 import modelcatalog  # noqa: E402
 import modellibrary  # noqa: E402
 import procstats  # noqa: E402
@@ -36,10 +37,10 @@ import voicereview  # noqa: E402
 import voices  # noqa: E402
 from version import HOMEPAGE, __version__  # noqa: E402
 
-APP_ID = "dev.meetscribe.app"
+APP_ID = "dev.mintomeet.app"
 APP_DIR = pathlib.Path(__file__).resolve().parent
-CONFIG_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_CONFIG_DIR", pathlib.Path.home() / ".config/meetscribe"))
-MEETINGS_DIR = pathlib.Path(os.environ.get("MEETSCRIBE_MEETINGS_DIR", pathlib.Path.home() / "MeetScribe"))
+CONFIG_DIR = pathlib.Path(os.environ.get("MINTOMEET_CONFIG_DIR", pathlib.Path.home() / ".config/mintomeet"))
+MEETINGS_DIR = pathlib.Path(os.environ.get("MINTOMEET_MEETINGS_DIR", pathlib.Path.home() / "MintoMeet"))
 AUTOSTART = pathlib.Path.home() / ".config/autostart" / f"{APP_ID}.desktop"
 
 OLD_ENGINE_SETTING = {0: "parakeet", 1: "whisper-small", 2: "whisper-medium"}   # settings saved before the model library
@@ -168,8 +169,8 @@ def prefs():
 def set_autostart(enabled):
     if enabled:
         AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
-        AUTOSTART.write_text("[Desktop Entry]\nType=Application\nName=MeetScribe\n"
-                             f"Exec={APP_DIR / 'meetscribe'} --background\nIcon=audio-input-microphone\n"
+        AUTOSTART.write_text("[Desktop Entry]\nType=Application\nName=MintoMeet\n"
+                             f"Exec={APP_DIR / 'mintomeet'} --background\nIcon=audio-input-microphone\n"
                              "X-GNOME-Autostart-enabled=true\nNoDisplay=false\n")
     elif AUTOSTART.exists():
         AUTOSTART.unlink()
@@ -177,7 +178,7 @@ def set_autostart(enabled):
 
 class Window(Adw.ApplicationWindow):
     def __init__(self, app, hooks=None):
-        super().__init__(application=app, title="MeetScribe", default_width=1360, default_height=840)
+        super().__init__(application=app, title="MintoMeet", default_width=1360, default_height=840)
         self.hooks = hooks          # the App when running for real (tray, notifications); None in tests
         self.proc = None
         self.out_dir = None
@@ -291,8 +292,8 @@ class Window(Adw.ApplicationWindow):
         menu.append("Learned voices…", "win.voices")
         menu.append("Storage…", "win.storage")
         menu.append("Preferences", "app.preferences")
-        menu.append("About MeetScribe", "app.about")
-        menu.append("Quit MeetScribe", "app.quit")
+        menu.append("About MintoMeet", "app.about")
+        menu.append("Quit MintoMeet", "app.quit")
         self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         self.menu_btn.set_tooltip_text("Learned voices, preferences and quit")
         models_action = Gio.SimpleAction.new("models", None)
@@ -892,14 +893,14 @@ class Window(Adw.ApplicationWindow):
         self.state = state
         titles = {
             "idle": ("Ready to record",
-                     "Press Start recording before your Zoom, Lark or other call begins. MeetScribe records your "
+                     "Press Start recording before your Zoom, Lark or other call begins. MintoMeet records your "
                      "computer's audio output and, if you want, your microphone."),
             "downloading": ("Downloading the speech model…",
                             "One-time download. Recording has already started, so nothing is lost."),
             "loading": ("Loading the speech model…", "Recording has already started, so nothing is lost."),
             "recording": ("Recording", "The live transcript appears on the right. You can leave this window in "
                                        "the background during your meeting."),
-            "finishing": ("Finishing the transcription…", "Please keep MeetScribe open until it's done."),
+            "finishing": ("Finishing the transcription…", "Please keep MintoMeet open until it's done."),
             "done": ("Transcript saved", "Open “Ask Agent” to summarize it, list action items or ask questions."),
             "cancelled": ("Stopped", "Recording stopped before transcription could start."),
             "error": ("Something went wrong", ""),
@@ -1009,7 +1010,7 @@ class Window(Adw.ApplicationWindow):
     def worker_cmd(self):
         python = APP_DIR / "venv/bin/python"
         if not python.exists():
-            self.set_state("error", "The speech engine isn't installed. Run install.sh in the meetscribe folder.")
+            self.set_state("error", "The speech engine isn't installed. Run install.sh in the mintomeet folder.")
             return None
         cmd = [str(python), str(APP_DIR / "worker.py")]
         if not prefs()["speakers"]:
@@ -1066,8 +1067,8 @@ class Window(Adw.ApplicationWindow):
             cmd.append("--no-system")
         if not cfg["mic"]:
             cmd.append("--no-mic")
-        if os.environ.get("MEETSCRIBE_SYSTEM_SOURCE"):
-            cmd += ["--system-source", os.environ["MEETSCRIBE_SYSTEM_SOURCE"]]
+        if os.environ.get("MINTOMEET_SYSTEM_SOURCE"):
+            cmd += ["--system-source", os.environ["MINTOMEET_SYSTEM_SOURCE"]]
         if not self.launch(cmd):
             return
         self.record_start = time.monotonic()
@@ -1149,7 +1150,7 @@ class Window(Adw.ApplicationWindow):
                 done, total = int(opts.get("done", 0)), int(opts.get("total", 0))
                 if self.state != "finishing":
                     self.set_state("finishing")
-                self.status_detail.set_text("Please keep MeetScribe open until it's done.")
+                self.status_detail.set_text("Please keep MintoMeet open until it's done.")
                 self.progress.set_fraction(done / total if total else 1)
                 self.progress.set_text(f"Transcribed {done} of {total} speech segments")
         elif line.startswith("SWITCH: "):
@@ -1238,7 +1239,7 @@ class Window(Adw.ApplicationWindow):
         low_mem = s["mem_avail"] < total * 0.1
         busy = s["system_cpu"] > 0.9
         text = (f"Whole computer: CPU {s['system_cpu']:.0%} busy · {size(s['mem_avail'])} memory free · "
-                f"{s['processes']} MeetScribe process{'es' if s['processes'] != 1 else ''}")
+                f"{s['processes']} MintoMeet process{'es' if s['processes'] != 1 else ''}")
         if low_mem or busy:
             text += ("\nYour computer is running low on memory." if low_mem else
                      "\nYour computer is very busy, so transcription may fall behind (nothing is lost).")
@@ -2067,7 +2068,7 @@ class Window(Adw.ApplicationWindow):
             return
         o = datasize.overview(MEETINGS_DIR)
         self.sizes_content.set_label(datasize.fmt(o["total"]))
-        tip = (f"MeetScribe data: {datasize.fmt(o['total'])} (meetings {datasize.fmt(o['totals']['meetings'])}, "
+        tip = (f"MintoMeet data: {datasize.fmt(o['total'])} (meetings {datasize.fmt(o['totals']['meetings'])}, "
                f"models {datasize.fmt(o['totals']['models'])}). Click to hide sizes.")
         if o["warnings"]:
             self.sizes_btn.add_css_class("warning")
@@ -2108,7 +2109,7 @@ class Window(Adw.ApplicationWindow):
         if self.model_in_use(model_id):
             return self.model_in_use(model_id)
         if [m.id for m in self.models] == [model_id]:
-            return "MeetScribe needs at least one speech model. Download another one first."
+            return "MintoMeet needs at least one speech model. Download another one first."
         return None
 
     def on_model_downloaded(self, model_id, ok, error):
@@ -2677,7 +2678,7 @@ class Window(Adw.ApplicationWindow):
         dialog.save(self, None, done)
 
     def export_to(self, target, options, on_done=None):
-        """Write the export; .md directly, .docx/.pdf through export.py in MeetScribe's own Python."""
+        """Write the export; .md directly, .docx/.pdf through export.py in MintoMeet's own Python."""
         messages = self.chat.messages if self.chat else []
         people = []
         names = {m.group(2) for m in map(SCREEN_RE.match, self.t_text().splitlines()) if m}
@@ -2800,7 +2801,7 @@ class Window(Adw.ApplicationWindow):
     # --- preferences -------------------------------------------------------
     def show_about(self):
         about = Adw.AboutDialog(
-            application_name="MeetScribe", application_icon="audio-input-microphone", version=__version__,
+            application_name="MintoMeet", application_icon="audio-input-microphone", version=__version__,
             developer_name="Saailverse Technologies", copyright="© 2026 Saailverse Technologies", license_type=Gtk.License.MIT_X11,
             comments="Record and transcribe your meetings on your own computer, then ask an AI agent about them.")
         if HOMEPAGE:
@@ -2819,13 +2820,13 @@ class Window(Adw.ApplicationWindow):
         rows = {
             "background": Adw.SwitchRow(
                 title="Keep running when the window is closed", active=p["background"],
-                subtitle="MeetScribe stays in the top bar (tray icon), keeps any recording going and can notice "
+                subtitle="MintoMeet stays in the top bar (tray icon), keeps any recording going and can notice "
                          "when a call starts."),
             "autostart": Adw.SwitchRow(title="Start when you log in", active=p["autostart"],
                                        subtitle="Opens quietly in the tray, ready for your first call."),
             "detect_calls": Adw.SwitchRow(
                 title="Ask to record when a call starts", active=p["detect_calls"],
-                subtitle="When Zoom, Lark, Teams or a browser starts using your microphone, MeetScribe offers to "
+                subtitle="When Zoom, Lark, Teams or a browser starts using your microphone, MintoMeet offers to "
                          "record, and offers to stop when the call ends."),
             "speakers": Adw.SwitchRow(
                 title="Tell speakers apart", active=p["speakers"],
@@ -2837,7 +2838,7 @@ class Window(Adw.ApplicationWindow):
         meet = Adw.PreferencesGroup(title="Meetings")
         meet.add(rows["detect_calls"])
         meet.add(rows["speakers"])
-        ai = Adw.PreferencesGroup(title="AI agent", description="Who answers in Ask Agent and in “meetscribe summarize”.")
+        ai = Adw.PreferencesGroup(title="AI agent", description="Who answers in Ask Agent and in “mintomeet summarize”.")
         agent_row = Adw.ActionRow(title=agents.describe(self.agent_cfg), subtitle=agents.usage_note(self.agent_cfg),
                                   use_markup=False)
         agent_row.set_subtitle_lines(2)
@@ -2897,8 +2898,8 @@ class Window(Adw.ApplicationWindow):
         if self.hooks and self.hooks.runs_in_background():
             self.set_visible(False)         # keep running in the tray
             if self.proc is not None:
-                self.hooks.notify("MeetScribe is still recording",
-                                  "Use the MeetScribe icon in the top bar to stop or reopen the window.")
+                self.hooks.notify("MintoMeet is still recording",
+                                  "Use the MintoMeet icon in the top bar to stop or reopen the window.")
             return True
         if self.chat is not None and self.chat.busy:
             self.chat.cancel()
@@ -2991,7 +2992,7 @@ class App(Adw.Application):
         n.set_default_action("app.show")
         for label, action in buttons:
             n.add_button(label, action)
-        self.send_notification("meetscribe", n)
+        self.send_notification("mintomeet", n)
 
     def quit_now(self):
         if self.held:
@@ -3004,11 +3005,11 @@ class App(Adw.Application):
         w = self.win
         rec = self.recording()
         can_toggle = w is not None and not w.retranscribing and w.state != "finishing"
-        return [("Open MeetScribe", True, self.show_window), None,
+        return [("Open MintoMeet", True, self.show_window), None,
                 ("Stop recording" if rec else "Start recording", can_toggle,
                  self.stop_recording if rec else self.start_recording),
                 ("Bookmark this moment", rec and w.state == "recording", lambda: w.add_bookmark()), None,
-                ("Quit MeetScribe", True, self.quit_all)]
+                ("Quit MintoMeet", True, self.quit_all)]
 
     def show_window(self):
         if self.win is not None:
@@ -3028,7 +3029,7 @@ class App(Adw.Application):
         if self.win is not None and self.win.proc is not None and not self.win.retranscribing:
             self.win.quit_after_stop = True     # finish and save the transcript first
             self.win.stop()
-            self.notify("Saving your meeting", "MeetScribe will close once the transcript is saved.")
+            self.notify("Saving your meeting", "MintoMeet will close once the transcript is saved.")
             return
         self.quit_now()
 
@@ -3062,6 +3063,8 @@ def make_private(*folders):
 
 def main():
     os.chdir(pathlib.Path.home())
+    if not (os.environ.get("MINTOMEET_CONFIG_DIR") or os.environ.get("MINTOMEET_MEETINGS_DIR")):
+        migrate.run()       # data left by MeetScribe, this app's former name
     make_private(MEETINGS_DIR, CONFIG_DIR)
     background = "--background" in sys.argv
     App(background=background).run([sys.argv[0]])

@@ -1,8 +1,8 @@
-# MeetScribe
+# MintoMeet
 
 **Record and transcribe your meetings on your own computer, then ask an AI agent about them.**
 
-MeetScribe is a Linux desktop app (GTK 4 / libadwaita) that records what you hear in a call and what you
+MintoMeet is a Linux desktop app (GTK 4 / libadwaita) that records what you hear in a call and what you
 say into your microphone, transcribes both live with a local speech model, tells the speakers apart, and
 learns their voices so it can name them in later meetings. When the call ends you can ask questions about
 it, get a summary or a follow-up email, and export it as Word, PDF, Markdown or one clean audio file.
@@ -15,7 +15,7 @@ your computer.
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-informational)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-informational)
 
-![MeetScribe showing a transcript with named speakers](docs/screenshots/transcript.png)
+![MintoMeet showing a transcript with named speakers](docs/screenshots/transcript.png)
 
 ## Features
 
@@ -25,7 +25,7 @@ your computer.
 - **A model library that knows your computer.** See each model's memory, processor and disk needs, how well it
   would run on *this* computer, and download or remove models with one click.
 - **Who said what.** Your microphone is always labelled *You*. Other voices are told apart and named
-  automatically once MeetScribe has learned them.
+  automatically once MintoMeet has learned them.
 - **Fix speakers quickly.** Click a name to change it, *Replace all* for every line of a detected speaker,
   or Ctrl+click / Shift+click / select several lines and **bulk assign** them at once. One Ctrl+Z undoes it.
 - **Review learned voices.** See every clip a person's voice was learned from, listen to them, and remove the
@@ -78,27 +78,30 @@ sudo pacman -S python-gobject gtk4 libadwaita libpulse ffmpeg curl
 ## Install
 
 ```bash
-git clone https://github.com/JustDevItPk/meetscribe.git
-cd meetscribe
+git clone https://github.com/JustDevItPk/mintomeet.git
+cd mintomeet
 ./install.sh
 ```
 
 No sudo is needed. The installer puts a private Python 3.12 with the speech engines in
-`~/.local/share/meetscribe`, downloads the Parakeet and speaker-recognition models (about 680 MB), adds the
-`meetscribe` command to `~/.local/bin` and an entry to your app menu.
+`~/.local/share/mintomeet`, downloads the Parakeet and speaker-recognition models (about 680 MB), adds the
+`mintomeet` command to `~/.local/bin` and an entry to your app menu.
 
-To update, `git pull` and run `./install.sh` again (quit MeetScribe from its tray menu first, and never in the
+To update, `git pull` and run `./install.sh` again (quit MintoMeet from its tray menu first, and never in the
 middle of a recording). To remove it, run `./uninstall.sh`. Your meetings and settings are kept unless you add
 `--purge`.
 
+> **Coming from MeetScribe?** That was this app's earlier name. Quit it, clone this repository and run
+> `./install.sh`: your meetings, settings, learned voices, API keys and downloaded models move over automatically.
+
 ## Using it
 
-1. **Before a call**, open MeetScribe and press **Start recording**. Wear headphones if you can: on speakers,
+1. **Before a call**, open MintoMeet and press **Start recording**. Wear headphones if you can: on speakers,
    your mic also hears the call.
 2. **During the call** the transcript appears as people speak. Click a speaker name to say who it is; from
    then on that voice is named automatically, in this meeting and in future ones.
 3. **After the call**, open **Ask Agent** and pick a suggestion such as *Summarize the meeting*, or type your
-   own question (Enter sends, Shift+Enter starts a new line). The first time, MeetScribe helps you choose an
+   own question (Enter sends, Shift+Enter starts a new line). The first time, MintoMeet helps you choose an
    AI agent if Claude Code isn't installed.
 4. **Export** from the header bar, or click **Transcribe again** to try another model on the saved audio.
 
@@ -141,35 +144,35 @@ asks for, choose a model from the list, press **Test connection**, then **Save**
 | **Other OpenAI-compatible server** | Its address (e.g. llama.cpp, vLLM, LiteLLM), a key if it needs one | That server |
 
 - The whole transcript is sent with each question, so choose a model that can read long texts: a one-hour
-  meeting is roughly 15,000 tokens. MeetScribe warns you when a meeting is too long for the chosen model, and
+  meeting is roughly 15,000 tokens. MintoMeet warns you when a meeting is too long for the chosen model, and
   tells Ollama to use a context window big enough for the meeting.
 - Each answer is labelled with the model that gave it, and you can switch agents in the middle of a chat: the
   new one sees the conversation so far.
 - API keys are kept in your desktop's keyring (GNOME Keyring or KWallet). Without a keyring they go in
-  `~/.config/meetscribe/api-keys.json`, readable only by you. If you already set `OPENAI_API_KEY`,
+  `~/.config/mintomeet/api-keys.json`, readable only by you. If you already set `OPENAI_API_KEY`,
   `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or similar, that is used when no key is saved.
 
 ### Command line
 
 ```bash
-meetscribe                         # open the window (--background: start in the tray)
-meetscribe record                  # record from the terminal, Ctrl+C to stop
-meetscribe record --engine whisper --model medium --language ur --live
-meetscribe file interview.mp4      # transcribe an existing audio or video file
-meetscribe summarize ~/MeetScribe/2026-11-03_100000
-meetscribe --version
+mintomeet                         # open the window (--background: start in the tray)
+mintomeet record                  # record from the terminal, Ctrl+C to stop
+mintomeet record --engine whisper --model medium --language ur --live
+mintomeet file interview.mp4      # transcribe an existing audio or video file
+mintomeet summarize ~/MintoMeet/2026-11-03_100000
+mintomeet --version
 ```
 
-`meetscribe record --help` lists every option.
+`mintomeet record --help` lists every option.
 
 ## Your data and privacy
 
-- **Audio and transcripts stay on your computer**, in `~/MeetScribe/<date_time>/`: two audio files (the call
+- **Audio and transcripts stay on your computer**, in `~/MintoMeet/<date_time>/`: two audio files (the call
   and your mic), the transcript, earlier transcript versions, the chat and your bookmarks.
-- **Speakers, learned voices and settings** are in `~/.config/meetscribe/`. A learned voice is a list of short
+- **Speakers, learned voices and settings** are in `~/.config/mintomeet/`. A learned voice is a list of short
   numeric voiceprints plus the words of each clip, not audio.
 - **Network use:** the installer and first use of a model download from GitHub and Hugging Face. **Ask Agent**
-  and `meetscribe summarize` send the meeting's *transcript text* (never audio), the names and emails of known
+  and `mintomeet summarize` send the meeting's *transcript text* (never audio), the names and emails of known
   participants and your questions to the AI agent you chose: Anthropic for Claude Code (which runs with all tools
   disabled, so it can only read the transcript it's given), the service you picked for an API key, or nothing
   at all for an agent on your own computer. Nothing else is sent anywhere, and there is no telemetry.
@@ -202,7 +205,7 @@ from source and run the tests, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for 
 
 ## License and credits
 
-MeetScribe is released under the [MIT License](LICENSE). © 2026 Saailverse Technologies.
+MintoMeet is released under the [MIT License](LICENSE). © 2026 Saailverse Technologies.
 
 It builds on excellent open-source work, downloaded at install time under their own licenses:
 
@@ -217,4 +220,4 @@ It builds on excellent open-source work, downloaded at install time under their 
 - [GTK](https://gtk.org), [libadwaita](https://gitlab.gnome.org/GNOME/libadwaita) and
   [PyGObject](https://pygobject.gnome.org) (LGPL), [FFmpeg](https://ffmpeg.org) (LGPL / GPL)
 
-MeetScribe is not affiliated with Anthropic, OpenAI, Google, NVIDIA, any other AI service or any call app.
+MintoMeet is not affiliated with Anthropic, OpenAI, Google, NVIDIA, any other AI service or any call app.

@@ -46,7 +46,7 @@ def fake_claude(tmp_path, monkeypatch):
 
 @pytest.fixture
 def keys(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETSCRIBE_NO_KEYRING", "1")
+    monkeypatch.setenv("MINTOMEET_NO_KEYRING", "1")
     monkeypatch.setattr(agentkeys, "CONFIG_DIR", tmp_path / "config")
     return agentkeys
 

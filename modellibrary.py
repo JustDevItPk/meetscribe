@@ -1,5 +1,5 @@
 """The "Speech models" library: what this computer can run, each model's requirements, and downloading or
-removing models. Downloads run in MeetScribe's own Python (`worker.py --download <id>`), one at a time, and
+removing models. Downloads run in MintoMeet's own Python (`worker.py --download <id>`), one at a time, and
 keep going when the dialog is closed."""
 import subprocess
 import threading
@@ -141,7 +141,7 @@ class ModelLibraryDialog(Adw.Dialog):
 
         computer = Adw.PreferencesGroup(
             title="This computer",
-            description="MeetScribe transcribes on your processor; no graphics card is needed. The advice below is an "
+            description="MintoMeet transcribes on your processor; no graphics card is needed. The advice below is an "
                         "estimate for this computer.")
         for title, value in (
                 ("Processor", f"{specs.cpu} · {specs.cores} cores ({specs.threads} threads)"),

@@ -8,7 +8,7 @@ from gi.repository import GLib
 POLL_SECONDS = 3
 START_POLLS = 2         # mic must be in use for ~6 s before we ask (ignores quick mic checks)
 END_POLLS = 3           # ...and released for ~9 s before we call the meeting over
-IGNORE = {"meetscribe", "parec", "open-whispr", "open-whispr-app", "speech-dispatcher", "gnome-shell",
+IGNORE = {"mintomeet", "parec", "open-whispr", "open-whispr-app", "speech-dispatcher", "gnome-shell",
           "pipewire", "wireplumber", "pavucontrol", "gnome-control-center"}
 NAMES = {"zoom": "Zoom", "zoomwebinar": "Zoom", "lark": "Lark", "feishu": "Feishu", "teams": "Microsoft Teams",
          "teams-for-linux": "Microsoft Teams", "slack": "Slack", "skypeforlinux": "Skype", "discord": "Discord",
