@@ -77,6 +77,20 @@ files.
 5. **Files.** `transcript.txt`, `segments.json` (each chunk with times, text, voiceprint and model) and
    `meeting.json` are written; a previous transcript is first moved to `versions/` (`meetings.archive_current`).
 
+## Background transcriptions
+
+`jobs.py` (pure Python) runs every transcription as a `Job` the window doesn't wait for: a recording (which,
+once you stop it, keeps transcribing what's left) or a *Transcribe again*. `Jobs.schedule()` starts waiting jobs
+up to `limit()` (by CPU cores, or the *Meetings transcribed at once* preference) while there's free memory for
+the model; each gets `threads_for(limit)` CPU threads.
+
+Pausing sends the recorder `SIGUSR1`: it prints `STATE: paused` and exits (while still capturing it first lets
+the recordings close). Every finished chunk is already in `transcript.partial.jsonl`, so resuming runs
+`worker.py --retranscribe <folder> --resume`, which skips (or trims) the audio already done and carries on. The
+window keeps `transcript.job.json` (model, language, paused or not); at start `Jobs.restore()` brings back every
+meeting that has one, which is how quitting mid-transcription (and a crash) continues next time. Both files are
+removed when the transcript is written.
+
 ## A meeting folder
 
 ```
@@ -90,6 +104,7 @@ files.
   speaker_map.json          speaker names you chose, by line
   versions/<stamp>/         earlier transcripts, each with version.json
   bookmarks.json, chat.json, chat.md
+  transcript.job.json, transcript.partial.jsonl   only while it's being transcribed (see above)
 ```
 
 `meeting.json` also holds the meeting's `tags` (a list; `meetings.tags()` / `set_tags()` keep them tidy:

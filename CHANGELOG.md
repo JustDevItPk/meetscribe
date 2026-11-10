@@ -6,6 +6,14 @@ All notable changes to MintoMeet are listed here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Transcription runs in the background.** The window stays usable while meetings are transcribed: open and
+  edit other meetings, chat, export or start a new recording. Stopping a recording frees the window at once and
+  the rest is transcribed behind the scenes; *Transcribe again* does the same.
+- **Pause and resume** any transcription (on the meeting's status card, or from the new *Transcribing* button in
+  the header). It carries on from where it stopped, even after quitting MintoMeet or a crash. Quitting no longer
+  waits for a transcription to finish: it pauses, and carries on the next time you open the app.
+- **Several meetings at once.** Up to 3 on a 16-core computer (fewer on smaller ones, and only while there's
+  enough free memory); the rest wait their turn. *Preferences → Meetings transcribed at once* changes it.
 - **Search across all meetings** (Search button, Ctrl+Shift+F or Ctrl+K): finds words in transcripts, Ask Agent
   conversations, bookmark notes, titles and tags, ignoring case and accents. Filter by people (only the lines they
   said), tags, date (today, last 7 days, this month, a range…) and where to look; sort by best match or date.
