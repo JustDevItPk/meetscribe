@@ -7,7 +7,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 dest="$HOME/.local/share/mintomeet"
-FILES=(worker gui chat speakers voices voicereview datasize storage meetings modelcatalog modellibrary procstats tray callwatch export summarize version agents agentkeys agentsetup migrate jobs)
+FILES=(worker gui chat speakers voices voicereview search searchpage tagsui datasize storage meetings modelcatalog modellibrary procstats tray callwatch export summarize version agents agentkeys agentsetup migrate jobs)
 
 hint() {
   if command -v apt >/dev/null; then echo "  sudo apt install $1"
