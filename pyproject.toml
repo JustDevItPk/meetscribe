@@ -1,8 +1,8 @@
 # MintoMeet is installed with ./install.sh, not pip. This file holds project metadata and tool settings.
 [project]
 name = "mintomeet"
-version = "0.1.0"
-description = "Record and transcribe meetings locally on Linux, then ask Claude about them."
+version = "0.2.0"
+description = "Record and transcribe meetings locally on Linux, then ask an AI agent about them."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
