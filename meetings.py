@@ -335,3 +335,66 @@ def mixed_audio_command(folder, target):
         mix = chains[0].replace("[a0]", ",alimiter=limit=0.89[out]")
     return cmd + ["-filter_complex", mix, "-map", "[out]", "-ac", "1", "-ar", "16000",
                   "-c:a", "libmp3lame", "-b:a", "48k", str(target)]
+
+
+# --- transcriptions in progress ------------------------------------------------------------------------------
+# A meeting being transcribed has two small files that disappear once its transcript is written:
+#   transcript.job.json        what to transcribe it with, and whether you paused it (kept by the window)
+#   transcript.partial.jsonl   every speech chunk finished so far (kept by the recorder), so a paused, quit or
+#                              interrupted transcription carries on from where it stopped
+JOB_FILE = "transcript.job.json"
+PARTIAL_FILE = "transcript.partial.jsonl"
+
+
+def read_partial(folder):
+    """(header, chunks) from a meeting's progress file; ({}, []) when there is none. The header names the
+    engine and model; each chunk has start, end, stream and text (empty when it held no words), plus label,
+    emb and model when it did. A line cut short by a crash is ignored."""
+    header, chunks = {}, []
+    try:
+        lines = (pathlib.Path(folder) / PARTIAL_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return header, chunks
+    for i, line in enumerate(lines):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if i == 0 and "engine" in item:
+            header = item
+        elif isinstance(item, dict) and "start" in item and "stream" in item:
+            chunks.append(item)
+    return header, chunks
+
+
+def partial_lines(folder):
+    """The transcript lines finished so far, in time order, as "[HH:MM:SS] Label: text"."""
+    _header, chunks = read_partial(folder)
+    said = sorted((c for c in chunks if c.get("text")), key=lambda c: c["start"])
+    return [f"[{fmt_time(c['start'])}] {c.get('label') or c['stream']}: {c['text']}" for c in said]
+
+
+def load_job(folder):
+    try:
+        job = json.loads((pathlib.Path(folder) / JOB_FILE).read_text(encoding="utf-8"))
+        return job if isinstance(job, dict) and job.get("model") else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_job(folder, **job):
+    path = pathlib.Path(folder) / JOB_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job), encoding="utf-8")
+    tmp.replace(path)
+
+
+def clear_job(folder, progress=True):
+    """Forget a meeting's transcription job (and, unless progress=False, what it had done)."""
+    names = (JOB_FILE, PARTIAL_FILE) if progress else (JOB_FILE,)
+    for name in names:
+        try:
+            (pathlib.Path(folder) / name).unlink()
+        except FileNotFoundError:
+            pass
+

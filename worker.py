@@ -12,6 +12,11 @@ With --control the recorder reads commands on stdin while recording. "ENGINE <pa
 switches the speech model mid-meeting: the new one loads in the background while the current one keeps
 transcribing, then takes over from the next speech chunk. Progress is reported as "SWITCH: ..." lines.
 
+Progress: every finished speech chunk is appended to transcript.partial.jsonl in the meeting folder. SIGUSR1
+pauses: the recorder prints "STATE: paused" and exits at once (while still capturing it first lets the
+recordings close). `--retranscribe FOLDER --resume` then carries on from the chunks already done, also after
+a crash or a reboot. The progress file is removed once the transcript is written.
+
 Speakers: each chunk of meeting audio gets a voiceprint (ERes2Net via sherpa-onnx). During the call chunks
 are grouped online into "Speaker 1", "Speaker 2", ...; after the call all voiceprints are re-clustered and
 compared with the voice profiles learned from earlier meetings (see voices.py) so known people get named.
@@ -19,6 +24,7 @@ compared with the voice profiles learned from earlier meetings (see voices.py) s
 import argparse
 import datetime
 import difflib
+import fcntl
 import gc
 import json
 import os
@@ -535,6 +541,8 @@ def main():
     ap.add_argument("--control", action="store_true",
                     help="accept commands on stdin while recording, e.g. ENGINE whisper medium en")
     ap.add_argument("--retranscribe", metavar="FOLDER", help="transcribe a finished meeting again from its saved audio")
+    ap.add_argument("--resume", action="store_true",
+                    help="with --retranscribe: carry on from the progress saved in the folder (same engine and model)")
     ap.add_argument("--prepare", action="store_true", help="download the Parakeet and speaker models and exit")
     ap.add_argument("--download", metavar="MODEL_ID", help="download one model from the catalog (modelcatalog.py) and exit")
     args = ap.parse_args()
@@ -621,6 +629,24 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
+    pausing = threading.Event()
+
+    def pause_now():
+        say("STATE: paused")
+        sys.stdout.flush()
+        os._exit(0)
+
+    def on_pause(*_):
+        """Stop here; what's done is in the progress file. While capturing, recordings must close first."""
+        if offline or not any(s.is_alive() for s in streams):
+            pause_now()
+        pausing.set()       # the main loop pauses once the streams have ended
+        stopping.set()
+        for s in streams:
+            s.stop()
+
+    signal.signal(signal.SIGUSR1, on_pause)
+
     Stream.T0 = time.monotonic()
     for s in streams:   # start capturing now so nothing is missed while the model loads
         s.start()
@@ -665,14 +691,68 @@ def main():
         threading.Thread(target=read_commands, args=(switcher,), daemon=True).start()
 
     segs = []
+    done_until = {}     # stream -> end of the last chunk already transcribed (when resuming)
+    header = {"engine": args.engine, "model": args.model if args.engine == "whisper" else None,
+              "language": language, "speakers": not args.no_speakers}
+    # Chunks keep the model that made them, so carrying on with another model is fine (the transcript then
+    # says "parakeet+whisper-medium", as after a live switch).
+    _saved_header, saved = meetings.read_partial(out) if (args.retranscribe and args.resume) else ({}, [])
+    if saved:
+        for c in saved:
+            done_until[c["stream"]] = max(done_until.get(c["stream"], 0.0), c["end"])
+            if c.get("text"):
+                emb = None if c.get("emb") is None else np.array(c["emb"], dtype=np.float32)
+                if speakers and emb is not None:    # rebuild the live speaker groups, so new lines match
+                    speakers.live_label(emb, c["end"] - c["start"])
+                segs.append({"start": c["start"], "end": c["end"], "stream": c["stream"],
+                             "label": c.get("label") or c["stream"], "text": c["text"], "emb": emb,
+                             "model": c.get("model") or model_now})
+        resumed = True
+    else:
+        saved, resumed = [], False
+    progress = open(out / meetings.PARTIAL_FILE, "a" if resumed else "w", encoding="utf-8", buffering=1)
+    try:
+        fcntl.flock(progress, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say(f"ERROR: {out} is already being transcribed.")
+        sys.exit(1)
+    if not resumed:
+        progress.write(json.dumps(header) + "\n")
+    else:
+        say(f"NOTICE: Carrying on from {fmt(max(done_until.values(), default=0))}.")
+
+    def checkpoint(start, end, stream, text, label=None, emb=None, model=None):
+        item = {"start": round(start, 2), "end": round(end, 2), "stream": stream, "text": text}
+        if text:
+            item.update(label=label, model=model,
+                        emb=None if emb is None else [round(float(x), 4) for x in emb])
+        progress.write(json.dumps(item) + "\n")
+
     with open(out / "transcript.live.txt", "w" if args.retranscribe else "a", encoding="utf-8") as live:
+        for g in sorted(segs, key=lambda g: g["start"]):     # what was done before: shown again at once
+            line = f"[{fmt(g['start'])}] {g['label']}: {g['text']}"
+            live.write(line + "\n")
+            say(line)
+        live.flush()
         while True:
+            if pausing.is_set() and not any(s.is_alive() for s in streams):
+                pause_now()
             try:
                 ts, stream, pcm = q.get(timeout=0.5)
             except queue.Empty:
                 if not any(s.is_alive() for s in streams) and q.empty():
                     break
                 continue
+            if stream in done_until:        # resuming: skip what's done, and the part of a chunk that is
+                length = len(pcm) / RATE
+                if ts + length <= done_until[stream] + 0.3:
+                    with stats.lock:
+                        stats.done += 1
+                    say(f"STATE: finishing done={stats.done} total={stats.total}")
+                    continue
+                if ts < done_until[stream]:
+                    pcm = pcm[int((done_until[stream] - ts) * RATE):]
+                    ts = done_until[stream]
             ready = switcher.take() if switcher else None
             if ready:       # a newly loaded model takes over from this chunk on; the old one is freed
                 engine, model_now = ready
@@ -680,10 +760,10 @@ def main():
                 say(f"SWITCH: done {model_now} at={ts:.1f}")
             audio = pcm.astype(np.float32) / 32768
             text = engine(audio)
+            secs = len(audio) / RATE
             with stats.lock:
                 stats.done += 1
             if text:
-                secs = len(audio) / RATE
                 emb = speakers.embed(audio) if speakers and stream != "You" else None
                 label = "You" if stream == "You" else (speakers.live_label(emb, secs) if speakers else stream)
                 segs.append({"start": ts, "end": ts + secs, "stream": stream, "label": label, "text": text,
@@ -692,6 +772,9 @@ def main():
                 live.write(line + "\n")
                 live.flush()
                 say(line)
+                checkpoint(ts, ts + secs, stream, text, label, emb, model_now)
+            else:
+                checkpoint(ts, ts + secs, stream, "")
             if stopping.is_set() or offline:
                 say(f"STATE: finishing done={stats.done} total={stats.total}")
             else:
@@ -717,6 +800,8 @@ def main():
     used = list(dict.fromkeys(g["model"] for g in sorted(segs, key=lambda g: g["start"]))) or [model_now]
     meetings.save_meta(out, model="+".join(used),     # "parakeet+whisper-medium" if you switched mid-meeting
                        transcribed=datetime.datetime.now().isoformat(timespec="seconds"))
+    progress.close()
+    (out / meetings.PARTIAL_FILE).unlink(missing_ok=True)
     say(f"DONE: {final}")
 
 
