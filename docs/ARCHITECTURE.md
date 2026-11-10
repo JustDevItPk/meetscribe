@@ -13,6 +13,8 @@ detail.
 │   ├─ speakers.py     speaker list + "Speakers" dialog                             │
 │   ├─ voicereview.py  "Learned voices" dialog                                      │
 │   ├─ storage.py      "Storage" dialog            datasize.py  disk-usage figures  │
+│   ├─ searchpage.py   "Search" page               search.py   searching (pure)   │
+│   ├─ tagsui.py       tag pills, tag filter, "Manage tags" window                │
 │   ├─ modellibrary.py "Speech models" dialog + background model downloads         │
 │   ├─ chat.py         Ask Agent conversations (Claude Code CLI or an API agent)    │
 │   ├─ agents.py       AI agents: settings, OpenAI / Anthropic / Ollama streaming   │
@@ -75,6 +77,20 @@ files.
 5. **Files.** `transcript.txt`, `segments.json` (each chunk with times, text, voiceprint and model) and
    `meeting.json` are written; a previous transcript is first moved to `versions/` (`meetings.archive_current`).
 
+## Background transcriptions
+
+`jobs.py` (pure Python) runs every transcription as a `Job` the window doesn't wait for: a recording (which,
+once you stop it, keeps transcribing what's left) or a *Transcribe again*. `Jobs.schedule()` starts waiting jobs
+up to `limit()` (by CPU cores, or the *Meetings transcribed at once* preference) while there's free memory for
+the model; each gets `threads_for(limit)` CPU threads.
+
+Pausing sends the recorder `SIGUSR1`: it prints `STATE: paused` and exits (while still capturing it first lets
+the recordings close). Every finished chunk is already in `transcript.partial.jsonl`, so resuming runs
+`worker.py --retranscribe <folder> --resume`, which skips (or trims) the audio already done and carries on. The
+window keeps `transcript.job.json` (model, language, paused or not); at start `Jobs.restore()` brings back every
+meeting that has one, which is how quitting mid-transcription (and a crash) continues next time. Both files are
+removed when the transcript is written.
+
 ## A meeting folder
 
 ```
@@ -88,7 +104,23 @@ files.
   speaker_map.json          speaker names you chose, by line
   versions/<stamp>/         earlier transcripts, each with version.json
   bookmarks.json, chat.json, chat.md
+  transcript.job.json, transcript.partial.jsonl   only while it's being transcribed (see above)
 ```
+
+`meeting.json` also holds the meeting's `tags` (a list; `meetings.tags()` / `set_tags()` keep them tidy:
+single spaces, no commas, no repeats that differ only in case).
+
+## Search
+
+`search.py` is pure Python and holds the whole library in memory: one `Doc` per meeting with its transcript
+lines, Ask Agent messages (Markdown removed), bookmark notes, title, tags and speakers. `Index.refresh()` re-reads
+only meetings whose files changed (`signature()`: size and time of meeting.json, the transcript, chat.json,
+bookmarks.json), so each search after the first is instant. `Query` turns the search box into folded terms
+(case and accents removed; `"phrases"`) plus filters, including typed ones (`from:`, `tag:`, `after:`,
+`before:`, `on:`, `in:`). A meeting matches when every term appears somewhere in it; the hits shown are the
+lines holding all terms or, if the terms are spread out, those holding the most. `spans()` maps matches back to
+the original text for highlighting (folding can change lengths). The window's Ctrl+F find bar uses the same
+matching (`plain_terms`, `spans`) on the open transcript.
 
 ## Speech models
 

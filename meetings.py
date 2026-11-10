@@ -106,6 +106,90 @@ def save_bookmarks(folder, marks):
     (pathlib.Path(folder) / "bookmarks.json").write_text(json.dumps(marks, indent=1), encoding="utf-8")
 
 
+# --- tags ("tags" in meeting.json) --------------------------------------------------------------------
+TAG_MAX = 40
+
+
+def normalize_tag(text):
+    """A tag as stored: single spaces, no commas (they separate tags when typing), at most TAG_MAX characters."""
+    return " ".join(str(text).replace(",", " ").split())[:TAG_MAX].strip()
+
+
+def _unique_tags(values):
+    """Normalized tags without repeats; tags differing only in case count as one (the first spelling wins)."""
+    out, seen = [], set()
+    for v in values:
+        t = normalize_tag(v)
+        if t and t.casefold() not in seen:
+            seen.add(t.casefold())
+            out.append(t)
+    return out
+
+
+def tags(folder):
+    value = load_meta(folder).get("tags")
+    return _unique_tags(value) if isinstance(value, list) else []
+
+
+def set_tags(folder, values):
+    """Replace a meeting's tags; returns them as stored."""
+    clean = _unique_tags(values)
+    save_meta(folder, tags=clean)
+    return clean
+
+
+def add_tag(folder, tag):
+    return set_tags(folder, tags(folder) + [tag])
+
+
+def remove_tag(folder, tag):
+    return set_tags(folder, [t for t in tags(folder) if t.casefold() != normalize_tag(tag).casefold()])
+
+
+def count_tags(tag_lists):
+    """{tag: number of meetings} over several meetings' tag lists, most used first. Spellings that differ
+    only in case are counted together under the most common one."""
+    counts, spellings = {}, {}
+    for lst in tag_lists:
+        for t in lst:
+            key = t.casefold()
+            counts[key] = counts.get(key, 0) + 1
+            spellings.setdefault(key, {}).setdefault(t, 0)
+            spellings[key][t] += 1
+    named = {max(spellings[k].items(), key=lambda kv: kv[1])[0]: n for k, n in counts.items()}
+    return dict(sorted(named.items(), key=lambda kv: (-kv[1], kv[0].casefold())))
+
+
+def all_tags(root):
+    return count_tags(tags(f) for f in list_meetings(root))
+
+
+def rename_tag(root, old, new):
+    """Rename a tag in every meeting (merging into `new` if a meeting has both). Returns meetings changed."""
+    old_key, new = normalize_tag(old).casefold(), normalize_tag(new)
+    if not old_key or not new:
+        return 0
+    changed = 0
+    for f in list_meetings(root):
+        current = tags(f)
+        if any(t.casefold() == old_key for t in current):
+            set_tags(f, [new if t.casefold() == old_key else t for t in current])
+            changed += 1
+    return changed
+
+
+def delete_tag(root, tag):
+    """Take a tag off every meeting. Returns the folders it was removed from (to put it back on undo)."""
+    key = normalize_tag(tag).casefold()
+    removed = []
+    for f in list_meetings(root):
+        current = tags(f)
+        if any(t.casefold() == key for t in current):
+            set_tags(f, [t for t in current if t.casefold() != key])
+            removed.append(f)
+    return removed
+
+
 # --- transcript versions (one per speech model run) -------------------------------------------------
 def model_id(engine, model=None):
     """'parakeet', 'whisper-medium', ... from the recorder's --engine / --model."""
@@ -284,7 +368,8 @@ def build_markdown(folder, messages, participants, summary=True, conversation=Fa
     folder = pathlib.Path(folder)
     model = current_model(folder)[0]
     made_with = f" · Transcribed with {model_name(model)}" if model else ""
-    parts = [f"# {title(folder)}", "", f"*{describe(folder)}{made_with}*", ""]
+    tagged = f" · Tags: {', '.join(tags(folder))}" if tags(folder) else ""
+    parts = [f"# {title(folder)}", "", f"*{describe(folder)}{made_with}{tagged}*", ""]
     if participants:
         parts += ["## Participants", ""] + [f"- {p}" for p in participants] + [""]
     text = summary_reply(messages) if summary else None
@@ -335,3 +420,66 @@ def mixed_audio_command(folder, target):
         mix = chains[0].replace("[a0]", ",alimiter=limit=0.89[out]")
     return cmd + ["-filter_complex", mix, "-map", "[out]", "-ac", "1", "-ar", "16000",
                   "-c:a", "libmp3lame", "-b:a", "48k", str(target)]
+
+
+# --- transcriptions in progress ------------------------------------------------------------------------------
+# A meeting being transcribed has two small files that disappear once its transcript is written:
+#   transcript.job.json        what to transcribe it with, and whether you paused it (kept by the window)
+#   transcript.partial.jsonl   every speech chunk finished so far (kept by the recorder), so a paused, quit or
+#                              interrupted transcription carries on from where it stopped
+JOB_FILE = "transcript.job.json"
+PARTIAL_FILE = "transcript.partial.jsonl"
+
+
+def read_partial(folder):
+    """(header, chunks) from a meeting's progress file; ({}, []) when there is none. The header names the
+    engine and model; each chunk has start, end, stream and text (empty when it held no words), plus label,
+    emb and model when it did. A line cut short by a crash is ignored."""
+    header, chunks = {}, []
+    try:
+        lines = (pathlib.Path(folder) / PARTIAL_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return header, chunks
+    for i, line in enumerate(lines):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if i == 0 and "engine" in item:
+            header = item
+        elif isinstance(item, dict) and "start" in item and "stream" in item:
+            chunks.append(item)
+    return header, chunks
+
+
+def partial_lines(folder):
+    """The transcript lines finished so far, in time order, as "[HH:MM:SS] Label: text"."""
+    _header, chunks = read_partial(folder)
+    said = sorted((c for c in chunks if c.get("text")), key=lambda c: c["start"])
+    return [f"[{fmt_time(c['start'])}] {c.get('label') or c['stream']}: {c['text']}" for c in said]
+
+
+def load_job(folder):
+    try:
+        job = json.loads((pathlib.Path(folder) / JOB_FILE).read_text(encoding="utf-8"))
+        return job if isinstance(job, dict) and job.get("model") else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_job(folder, **job):
+    path = pathlib.Path(folder) / JOB_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job), encoding="utf-8")
+    tmp.replace(path)
+
+
+def clear_job(folder, progress=True):
+    """Forget a meeting's transcription job (and, unless progress=False, what it had done)."""
+    names = (JOB_FILE, PARTIAL_FILE) if progress else (JOB_FILE,)
+    for name in names:
+        try:
+            (pathlib.Path(folder) / name).unlink()
+        except FileNotFoundError:
+            pass
+

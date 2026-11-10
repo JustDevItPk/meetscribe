@@ -7,7 +7,6 @@ import os
 import pathlib
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -18,20 +17,25 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
 import callwatch  # noqa: E402
 import agents  # noqa: E402
 import agentsetup  # noqa: E402
 import chat  # noqa: E402
 import datasize  # noqa: E402
+import jobs  # noqa: E402
 import meetings  # noqa: E402
 import migrate  # noqa: E402
 import modelcatalog  # noqa: E402
 import modellibrary  # noqa: E402
 import procstats  # noqa: E402
+import search  # noqa: E402
+import searchpage  # noqa: E402
 import speakers  # noqa: E402
 import storage  # noqa: E402
+import tagsui  # noqa: E402
 import tray  # noqa: E402
 import voicereview  # noqa: E402
 import voices  # noqa: E402
@@ -68,8 +72,8 @@ SPEAKER_N_RE = re.compile(r"^Speaker \d+$")
 SAVE_DELAY_MS = 800
 SPEAKER_COLOURS = ["#3584e4", "#c061cb", "#e66100", "#2190a4", "#986a44", "#1c71d8", "#a51d2d", "#813d9c"]
 NO_AUDIO_AFTER = 15     # seconds of recording before warning about silence
-DEFAULT_PREFS = {"background": True, "detect_calls": True, "autostart": False, "speakers": True}
-RECORDING_STATES = ("downloading", "loading", "recording", "finishing")
+DEFAULT_PREFS = {"background": True, "detect_calls": True, "autostart": False, "speakers": True,
+                 "parallel": 0}      # meetings transcribed at once; 0 = chosen for this computer
 
 CSS = """
 .timer { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; }
@@ -180,18 +184,28 @@ class Window(Adw.ApplicationWindow):
     def __init__(self, app, hooks=None):
         super().__init__(application=app, title="MintoMeet", default_width=1360, default_height=840)
         self.hooks = hooks          # the App when running for real (tray, notifications); None in tests
-        self.proc = None
-        self.out_dir = None
+        self.out_dir = None         # the meeting on screen
         self.chat = None
-        self.state = "idle"     # idle, downloading, loading, recording, finishing, done, cancelled, error
+        # What the status card shows: the recorder (downloading, loading, recording) while a call is recorded,
+        # else "job" when the meeting on screen is being transcribed, else idle, done, cancelled or error.
+        self.state = "idle"
+        self.rec_phase = "loading"  # the recorder's phase while it captures
+        self.base = ("idle", None)  # the card's state for the meeting on screen when nothing is transcribing
         self.deferred = False
-        self.retranscribing = False
+        # Every transcription runs in the background (see jobs.py): the recording, what's left of it after
+        # you stop, and "Transcribe again". The window stays free, several meetings can be transcribed at once,
+        # and each can be paused and resumed.
+        self.jobs = jobs.Jobs(APP_DIR / "venv/bin/python", APP_DIR / "worker.py", on_change=self.on_job_change,
+                              on_output=self.on_job_output, on_finished=self.on_job_finished,
+                              post=lambda fn, *a: GLib.idle_add(fn, *a), limit=prefs()["parallel"],
+                              extra_args=lambda: [] if prefs()["speakers"] else ["--no-speakers"])
+        self.usage_job = None       # the job whose CPU and memory the status card shows
+        self.row_info = {}          # meeting folder -> its sidebar row's info label (updated as jobs progress)
         self.record_start = 0.0
         self.peaks = {"them": 0.0, "you": 0.0}
         self.heard = {"them": False, "you": False}
-        self.quit_after_stop = False
+        self.quitting = False
         self.quit_dialog = None
-        self.last_error = None
         self.reply_label = None
         self.reply_text = ""
         self.loading_transcript = False
@@ -215,9 +229,15 @@ class Window(Adw.ApplicationWindow):
         self.viewing = None         # earlier transcript version shown read-only, or None for the current one
         self.export_dialog = None
         self.retx_dialog = None
+        self.find_matches = []      # (start, end) buffer offsets of the transcript find bar's matches
+        self.find_current = -1
+        self.find_timer = 0
+        self.chat_widgets = []      # one widget per Ask Agent message, to scroll to a search result
+        self.came_from_search = False
+        self.syncing_search = False
 
         provider = Gtk.CssProvider()
-        provider.load_from_string(CSS)
+        provider.load_from_string(CSS + tagsui.CSS + searchpage.CSS)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -236,7 +256,17 @@ class Window(Adw.ApplicationWindow):
         columns = Gtk.Box(spacing=18)
         for side in ("top", "bottom", "start", "end"):
             getattr(columns, f"set_margin_{side}")(16)
-        view.set_content(columns)
+        # the meeting view, or the Search page in its place
+        self.main_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.main_stack.add_named(columns, "meeting")
+        self.search_page = searchpage.SearchPage(
+            MEETINGS_DIR, open_hit=self.open_search_hit, open_meeting=self.open_search_meeting,
+            on_back=self.close_search,
+            extra_folders=lambda: [self.rec.folder] if self.rec is not None else [])
+        for side in ("top", "bottom", "start", "end"):
+            getattr(self.search_page, f"set_margin_{side}")(16)
+        self.main_stack.add_named(self.search_page, "search")
+        view.set_content(self.main_stack)
 
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_end=4)
         left.append(self.build_status_card())
@@ -267,6 +297,19 @@ class Window(Adw.ApplicationWindow):
         GLib.timeout_add_seconds(1, self.on_tick)
         self.set_state("idle")
         self.refresh_sidebar()
+        self.jobs.restore(MEETINGS_DIR)     # transcriptions paused or interrupted last time carry on
+        self.refresh_sidebar()
+        self.update_jobs_button()
+
+    @property
+    def rec(self):
+        """The job recording a call right now, or None."""
+        return self.jobs.capturing()
+
+    @property
+    def vjob(self):
+        """The transcription job of the meeting on screen (recording, waiting, running or paused), or None."""
+        return self.jobs.get(self.out_dir)
 
     # --- building the UI -------------------------------------------
     @staticmethod
@@ -286,10 +329,25 @@ class Window(Adw.ApplicationWindow):
                                            "then click a speaker name on a transcript line to say who spoke")
         self.speakers_btn.connect("clicked", lambda _b: self.open_speakers_dialog())
         header.pack_start(self.speakers_btn)
+        self.search_btn = Gtk.ToggleButton(child=self.icon_label("system-search-symbolic", "Search"))
+        self.search_btn.set_tooltip_text("Search every meeting: what was said, Ask Agent answers, bookmarks, "
+                                         "titles, tags, people and dates (Ctrl+Shift+F)")
+        self.search_btn.connect("toggled", self.on_search_toggled)
+        header.pack_start(self.search_btn)
+        self.results_btn = Gtk.Button(child=self.icon_label("go-previous-symbolic", "Back to results"), visible=False)
+        self.results_btn.add_css_class("flat")
+        self.results_btn.set_tooltip_text("Go back to your search results")
+        self.results_btn.connect("clicked", lambda _b: self.open_search(keep_place=True))
+        header.pack_start(self.results_btn)
+        for name, handler in (("search", lambda: self.open_search()), ("find", lambda: self.open_find())):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _a, _p, h=handler: h())
+            self.add_action(action)
 
         menu = Gio.Menu()
         menu.append("Speech models…", "win.models")
         menu.append("Learned voices…", "win.voices")
+        menu.append("Manage tags…", "win.tags")
         menu.append("Storage…", "win.storage")
         menu.append("Preferences", "app.preferences")
         menu.append("About MintoMeet", "app.about")
@@ -302,6 +360,9 @@ class Window(Adw.ApplicationWindow):
         voices_action = Gio.SimpleAction.new("voices", None)
         voices_action.connect("activate", lambda _a, _p: self.open_voice_review())
         self.add_action(voices_action)
+        tags_action = Gio.SimpleAction.new("tags", None)
+        tags_action.connect("activate", lambda _a, _p: self.open_manage_tags())
+        self.add_action(tags_action)
         storage_action = Gio.SimpleAction.new("storage", None)
         storage_action.connect("activate", lambda _a, _p: self.open_storage())
         self.add_action(storage_action)
@@ -312,6 +373,13 @@ class Window(Adw.ApplicationWindow):
         self.sizes_btn.connect("toggled", self.on_sizes_toggled)
         header.pack_end(self.sizes_btn)
         header.pack_end(self.menu_btn)
+        self.jobs_content = Adw.ButtonContent(icon_name="view-list-bullet-symbolic", label="")
+        self.jobs_btn = Gtk.MenuButton(child=self.jobs_content, visible=False)
+        self.jobs_btn.set_tooltip_text("Meetings being transcribed: see progress, pause, resume or open them")
+        self.jobs_popover = Gtk.Popover()
+        self.jobs_btn.set_popover(self.jobs_popover)
+        self.jobs_popover.connect("notify::visible", lambda p, _x: p.get_visible() and self.fill_jobs_popover())
+        header.pack_end(self.jobs_btn)
         self.folder_btn = Gtk.Button(icon_name="folder-symbolic")
         self.folder_btn.set_tooltip_text("Open this meeting's folder (transcript, audio recordings, chat)")
         self.folder_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Open meeting folder"])
@@ -335,6 +403,8 @@ class Window(Adw.ApplicationWindow):
         self.new_btn.set_tooltip_text("Clear the window, ready to record a new meeting")
         self.new_btn.connect("clicked", lambda _b: self.new_meeting())
         box.append(self.new_btn)
+        self.tag_filter = tagsui.TagFilter(on_changed=self.refresh_sidebar)
+        box.append(self.tag_filter)
         self.meeting_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.meeting_list.add_css_class("navigation-sidebar")
         self.meeting_list.connect("row-activated", self.on_meeting_row)
@@ -367,6 +437,9 @@ class Window(Adw.ApplicationWindow):
         self.size_label.add_css_class("size-note")
         tags.append(self.size_label)
         col.append(tags)
+        self.tag_editor = tagsui.TagEditor(MEETINGS_DIR, on_changed=lambda _f: self.refresh_sidebar(),
+                                           on_manage=self.open_manage_tags)
+        col.append(self.tag_editor)
         return col
 
     def build_title_row(self):
@@ -408,6 +481,18 @@ class Window(Adw.ApplicationWindow):
 
         self.progress = Gtk.ProgressBar(visible=False, show_text=True)
         card.append(self.progress)
+        self.job_controls = Gtk.Box(spacing=8, halign=Gtk.Align.START, visible=False)
+        self.pause_btn = Gtk.Button(child=self.icon_label("media-playback-pause-symbolic", "Pause"))
+        self.pause_btn.add_css_class("pill")
+        self.pause_btn.connect("clicked", lambda _b: self.toggle_pause(self.vjob))
+        self.cancel_btn = Gtk.Button(child=self.icon_label("process-stop-symbolic", "Cancel"))
+        self.cancel_btn.add_css_class("pill")
+        self.cancel_btn.add_css_class("flat")
+        self.cancel_btn.set_tooltip_text("Stop transcribing again and keep the transcript this meeting already has")
+        self.cancel_btn.connect("clicked", lambda _b: self.confirm_cancel(self.vjob))
+        self.job_controls.append(self.pause_btn)
+        self.job_controls.append(self.cancel_btn)
+        card.append(self.job_controls)
         self.meters = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, visible=False)
         self.them_bar, self.them_note = self.add_meter("Meeting audio (other people)")
         self.you_bar, self.you_note = self.add_meter("Your microphone")
@@ -599,6 +684,8 @@ class Window(Adw.ApplicationWindow):
         self.t_buf.create_tag("speaker-link", underline=Pango.Underline.SINGLE)
         self.t_buf.create_tag("flash", background="#f6d32d")
         self.t_buf.create_tag("bulk", background="rgba(53,132,228,0.18)")
+        self.t_buf.create_tag("find", background="rgba(246,211,45,0.45)")
+        self.t_buf.create_tag("find-current", background="#ffa348", foreground="#000000")
         self.t_view = Gtk.TextView(buffer=self.t_buf, editable=False, cursor_visible=False,
                                    wrap_mode=Gtk.WrapMode.WORD_CHAR, pixels_below_lines=4)
         for side in ("top", "bottom", "left", "right"):
@@ -683,6 +770,7 @@ class Window(Adw.ApplicationWindow):
         bulk.append(assign)
         self.bulk_bar.set_child(bulk)
         t_page.append(self.bulk_bar)
+        t_page.append(self.build_find_bar())
         t_page.append(hint_row)
         t_page.append(self.play_box)
         t_page.append(self.t_stack)
@@ -698,6 +786,131 @@ class Window(Adw.ApplicationWindow):
         actions.append(self.ask_btn)
         t_page.append(actions)
         return t_page
+
+    def build_find_bar(self):
+        """Ctrl+F: find words in the open transcript, with every match highlighted and next / previous."""
+        self.find_bar = Gtk.SearchBar(show_close_button=True)
+        box = Gtk.Box(spacing=6)
+        self.find_entry = Gtk.SearchEntry(placeholder_text="Find in this transcript", width_chars=32)
+        self.find_entry.connect("search-changed", lambda _e: self.run_find())
+        self.find_entry.connect("activate", lambda _e: self.step_find(1))
+        self.find_entry.connect("next-match", lambda _e: self.step_find(1))
+        self.find_entry.connect("previous-match", lambda _e: self.step_find(-1))
+        self.find_entry.connect("stop-search", lambda _e: self.find_bar.set_search_mode(False))
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, key, _code, mods: key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                     and bool(mods & Gdk.ModifierType.SHIFT_MASK) and (self.step_find(-1) or True))
+        self.find_entry.add_controller(keys)
+        box.append(self.find_entry)
+        self.find_count = Gtk.Label(width_chars=12)
+        self.find_count.add_css_class("dim-label")
+        self.find_count.add_css_class("caption")
+        box.append(self.find_count)
+        for icon, step, tip in (("go-up-symbolic", -1, "Previous match (Shift+Enter)"),
+                                ("go-down-symbolic", 1, "Next match (Enter)")):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip)
+            b.add_css_class("flat")
+            b.connect("clicked", lambda _b, s=step: self.step_find(s))
+            box.append(b)
+        everywhere = Gtk.Button(label="Search all meetings")
+        everywhere.add_css_class("flat")
+        everywhere.set_tooltip_text("Look for these words in every meeting (Ctrl+Shift+F)")
+        everywhere.connect("clicked", lambda _b: self.open_search(self.find_entry.get_text()))
+        box.append(everywhere)
+        self.find_bar.set_child(box)
+        self.find_bar.connect_entry(self.find_entry)
+        self.find_bar.connect("notify::search-mode-enabled",
+                              lambda bar, _p: bar.get_search_mode() or self.clear_find())
+        return self.find_bar
+
+    def open_find(self, text=None, line=None):
+        """Show the find bar (with `text`), going to the first match at or after transcript `line`."""
+        if self.main_stack.get_visible_child_name() == "search":
+            self.search_page.entry.grab_focus()
+            return
+        self.stack.set_visible_child_name("transcript")
+        self.find_bar.set_search_mode(True)
+        if text is not None and text != self.find_entry.get_text():
+            self.find_entry.set_text(text)
+        self.run_find(line=line)
+        self.find_entry.grab_focus()
+        self.find_entry.set_position(-1)
+
+    def clear_find(self):
+        self.t_buf.remove_tag_by_name("find", self.t_buf.get_start_iter(), self.t_buf.get_end_iter())
+        self.t_buf.remove_tag_by_name("find-current", self.t_buf.get_start_iter(), self.t_buf.get_end_iter())
+        self.find_matches, self.find_current = [], -1
+        self.find_count.set_text("")
+
+    def run_find(self, line=None, scroll=True):
+        """Highlight every match of the find bar's words; select the one at `line`, near the last one, or
+        the first after the cursor."""
+        before = self.find_matches[self.find_current][0] if 0 <= self.find_current < len(self.find_matches) else None
+        self.clear_find()
+        terms = search.plain_terms(self.find_entry.get_text())
+        if not terms:
+            return
+        buf = self.t_buf
+        for n in range(buf.get_line_count()):
+            ok, start = buf.get_iter_at_line(n)
+            if not ok:
+                continue
+            end = start.copy()
+            if not end.ends_line():
+                end.forward_to_line_end()
+            off = start.get_offset()
+            for a, b in search.spans(buf.get_text(start, end, False), terms):
+                self.find_matches.append((off + a, off + b))
+                buf.apply_tag_by_name("find", buf.get_iter_at_offset(off + a), buf.get_iter_at_offset(off + b))
+        if not self.find_matches:
+            self.find_count.set_text("No matches")
+            return
+        if line is not None:
+            at = buf.get_iter_at_line(line)[1].get_offset()
+        elif before is not None:
+            at = before
+        else:
+            at = buf.get_iter_at_mark(buf.get_insert()).get_offset()
+        i = next((k for k, (a, _b) in enumerate(self.find_matches) if a >= at), 0)
+        self.select_find(i, scroll)
+
+    def select_find(self, i, scroll=True):
+        buf = self.t_buf
+        buf.remove_tag_by_name("find-current", buf.get_start_iter(), buf.get_end_iter())
+        if not self.find_matches:
+            return
+        self.find_current = i % len(self.find_matches)
+        a, b = self.find_matches[self.find_current]
+        buf.apply_tag_by_name("find-current", buf.get_iter_at_offset(a), buf.get_iter_at_offset(b))
+        self.find_count.set_text(f"{self.find_current + 1} of {len(self.find_matches)}")
+        if scroll:
+            self.scroll_transcript_to(buf.get_iter_at_offset(a))
+
+    def scroll_transcript_to(self, it):
+        """Scroll so `it` shows in the upper part of the transcript. Through a mark, because right after a
+        meeting loads the lines aren't measured yet and scroll_to_iter would land in the wrong place."""
+        mark = self.t_buf.get_mark("search-target") or self.t_buf.create_mark("search-target", it, True)
+        self.t_buf.move_mark(mark, it)
+        self.t_view.scroll_to_mark(mark, 0.1, True, 0.0, 0.35)
+
+    def step_find(self, step):
+        if self.find_matches:
+            self.select_find(self.find_current + step)
+        elif self.find_entry.get_text():
+            self.run_find()
+
+    def schedule_find(self):
+        """Re-highlight after the transcript changed (new live lines, edits), without jumping around."""
+        bar = getattr(self, "find_bar", None)
+        if bar is None or not bar.get_search_mode() or self.find_timer:
+            return
+
+        def again():
+            self.find_timer = 0
+            if self.find_bar.get_search_mode():
+                self.run_find(scroll=False)
+            return False
+        self.find_timer = GLib.timeout_add(400, again)
 
     def build_chat_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -889,7 +1102,19 @@ class Window(Adw.ApplicationWindow):
 
     # --- state machine ---------------------------------------------
     def set_state(self, state, detail=None):
-        """Single place that decides what every widget shows for each phase."""
+        """Single place that decides what every widget shows. While a call is recorded the status card shows
+        the recorder; otherwise, when the meeting on screen is being transcribed, it shows that transcription."""
+        recorder = ("downloading", "loading", "recording")
+        if state not in recorder and state != "job":
+            self.base = (state, detail)     # what to show again once a recording or transcription is over
+        rec, job = self.rec, self.vjob
+        if rec is not None:
+            if state not in recorder:
+                state, detail = self.rec_phase, None
+        elif job is not None and state != "error":
+            state, detail = "job", None
+        elif state in recorder or state == "job":
+            state, detail = self.base
         self.state = state
         titles = {
             "idle": ("Ready to record",
@@ -898,61 +1123,100 @@ class Window(Adw.ApplicationWindow):
             "downloading": ("Downloading the speech model…",
                             "One-time download. Recording has already started, so nothing is lost."),
             "loading": ("Loading the speech model…", "Recording has already started, so nothing is lost."),
-            "recording": ("Recording", "The live transcript appears on the right. You can leave this window in "
-                                       "the background during your meeting."),
-            "finishing": ("Finishing the transcription…", "Please keep MintoMeet open until it's done."),
+            "recording": ("Recording", "The live transcript appears on the right. You can open other meetings "
+                                       "or leave this window in the background during your meeting."),
             "done": ("Transcript saved", "Open “Ask Agent” to summarize it, list action items or ask questions."),
             "cancelled": ("Stopped", "Recording stopped before transcription could start."),
             "error": ("Something went wrong", ""),
         }
-        title, text = titles[state]
-        if state == "finishing" and self.retranscribing:
-            title = "Transcribing again…"
+        if state == "job":
+            title, text = self.job_texts(job)
+        else:
+            title, text = titles[state]
         self.status_title.set_text(title)
         self.status_detail.set_text(detail or text)
 
-        busy = state in RECORDING_STATES
-        recording = busy and not self.retranscribing
-        working = state in ("downloading", "loading", "finishing")
+        recording = state in ("downloading", "loading", "recording")
+        working = state in ("downloading", "loading") or (state == "job" and job.state in ("running", "pausing"))
         self.spinner.set_visible(working)
         self.status_icon.set_visible(not working)
-        self.status_icon.set_from_icon_name({
-            "recording": "media-record-symbolic", "done": "emblem-ok-symbolic",
-            "error": "dialog-warning-symbolic", "cancelled": "dialog-information-symbolic",
-        }.get(state, "audio-input-microphone-symbolic"))
+        icon = {"recording": "media-record-symbolic", "done": "emblem-ok-symbolic", "error": "dialog-warning-symbolic",
+                "cancelled": "dialog-information-symbolic"}.get(state, "audio-input-microphone-symbolic")
+        if state == "job":
+            icon = "dialog-warning-symbolic" if job.error else \
+                "media-playback-pause-symbolic" if job.state == "paused" else "document-open-recent-symbolic"
+        self.status_icon.set_from_icon_name(icon)
         self.timer_label.set_visible(recording)
-        self.meters.set_visible(state in ("downloading", "loading", "recording"))
-        self.progress.set_visible(state in ("downloading", "finishing"))
-        self.usage_box.set_visible(self.proc is not None)
-        self.settings_group.set_sensitive(not busy)
-        self.meeting_list.set_sensitive(not busy)
-        self.new_btn.set_sensitive(not busy)
-        self.bookmark_btn.set_visible(state in ("downloading", "loading", "recording") and not self.retranscribing)
+        self.meters.set_visible(recording)
+        if state == "job":
+            self.progress.set_visible(bool(job.total))
+            if job.total:
+                self.progress.set_fraction(job.fraction)
+                self.progress.set_text(f"Transcribed {job.done} of {job.total} speech segments")
+        else:
+            self.progress.set_visible(state == "downloading")
+        self.job_controls.set_visible(state == "job")
+        if state == "job":
+            paused = job.state == "paused"
+            self.pause_btn.set_child(self.icon_label("media-playback-start-symbolic" if paused else
+                                                     "media-playback-pause-symbolic", "Resume" if paused else "Pause"))
+            self.pause_btn.set_tooltip_text(
+                "Carry on from where it stopped" if paused else
+                "Stop for now; it carries on from where it stopped when you resume, also after you quit MintoMeet")
+            self.pause_btn.set_sensitive(job.state in ("queued", "running", "paused"))
+            self.cancel_btn.set_visible(job.kind == "again")
+        self.watch_usage(rec if rec is not None else job if job is not None and job.proc is not None else None)
+        self.settings_group.set_sensitive(rec is None)
+        self.new_btn.set_sensitive(rec is None)
+        self.bookmark_btn.set_visible(rec is not None)
 
         self.start_btn.remove_css_class("suggested-action")
         self.start_btn.remove_css_class("destructive-action")
-        if recording:
+        if rec is not None:
             self.start_btn.set_child(self.icon_label("media-playback-stop-symbolic", "Stop recording"))
             self.start_btn.add_css_class("destructive-action")
-            self.start_btn.set_tooltip_text("Stop recording and finish transcribing what was said")
+            self.start_btn.set_tooltip_text("Stop recording; what's left is transcribed in the background")
         else:
             self.start_btn.set_child(self.icon_label("media-record-symbolic", "Start recording"))
             self.start_btn.add_css_class("suggested-action")
             self.start_btn.set_tooltip_text("Start recording the meeting audio and transcribing it")
-        self.start_btn.set_sensitive(state != "finishing" and not self.retranscribing)
         self.refresh_buttons()
         self.update_tag()
         if self.hooks:
             self.hooks.state_changed()
 
+    def job_texts(self, job):
+        """Title and explanation for the status card while the meeting on screen is being transcribed."""
+        name = meetings.model_name(job.model_id)
+        again = job.kind == "again"
+        if job.error:
+            return "Transcription stopped", f"{job.error} Press Resume to try again."
+        if job.state == "pausing":
+            return "Pausing…", "Saving what's done so far."
+        if job.state == "running":
+            return ("Transcribing again…" if again else "Finishing the transcription…",
+                    job.phase or f"Using {name}. Keep using MintoMeet as usual: open other meetings, chat or "
+                                  "record a new one.")
+        if job.state == "queued":
+            n = len(self.jobs.running())
+            return "Waiting to transcribe", (f"{n} other meeting{'s are' if n != 1 else ' is'} being transcribed. "
+                                             f"This one starts with {name} as soon as there's room.")
+        if job.state == "paused":
+            done = f"{job.fraction:.0%} is done. " if job.total else ""
+            return "Transcription paused", (f"{done}Resume carries on with {name} from where it stopped, also after "
+                                            "you quit MintoMeet.")
+        return "Transcribing…", ""
+
     def refresh_buttons(self):
         has_text = bool(self.t_text().strip())
-        busy = self.state in RECORDING_STATES
+        job = self.vjob
+        locked = job is not None                            # being transcribed: the transcript will change
+        live_here = job is not None and job.kind == "recording"    # no full transcript yet
         chatting = self.chat is not None and self.chat.busy
         have_meeting = self.out_dir is not None and self.out_dir.exists()
         self.copy_t_btn.set_sensitive(has_text)
-        self.ask_btn.set_sensitive(has_text and not busy)
-        editable = has_text and not busy and self.out_dir is not None and self.viewing is None
+        self.ask_btn.set_sensitive(has_text and not live_here)
+        editable = has_text and not locked and self.out_dir is not None and self.viewing is None
         self.t_view.set_editable(editable)
         self.t_view.set_cursor_visible(editable)
         self.edit_hint.set_visible(has_text)
@@ -962,21 +1226,24 @@ class Window(Adw.ApplicationWindow):
             "Click a time to hear that moment. Click a speaker name to choose who said it; Ctrl+click several "
             "names (or select across lines) to bulk assign a speaker. Click anywhere else to fix mistakes; "
             "changes save automatically (Ctrl+Z undoes)." if editable else
+            "This meeting is being transcribed again; you can edit the text once that has finished. Click a time "
+            "to hear that moment." if locked and not live_here else
             "Click a time to hear that moment, or a speaker name to choose who is speaking; Ctrl+click several "
-            "names to bulk assign a speaker. Text editing opens once the recording has finished.")
+            "names to bulk assign a speaker. Text editing opens once the transcription has finished.")
         self.folder_btn.set_sensitive(have_meeting)
-        self.export_btn.set_sensitive(have_meeting and has_text and not busy)
+        self.export_btn.set_sensitive(have_meeting and has_text and not live_here)
         has_audio = have_meeting and any((self.out_dir / n).exists() for n in ("audio-meeting.ogg", "audio-mic.ogg"))
-        self.retx_btn.set_visible(has_audio and not busy)
+        self.retx_btn.set_visible(has_audio and not locked)
         self.title_label.set_sensitive(self.out_dir is not None)
         self.title_hint.set_visible(self.out_dir is not None)
         self.t_stack.set_visible_child_name("text" if has_text else "empty")
         self.t_empty.set_description(
             "Recording. Whisper transcribes after you stop, so there is no live transcript."
-            if busy and self.deferred else
+            if job is not None and job.state == "capturing" and self.deferred else
+            "Transcribing. Lines appear here as they're done." if live_here else
             "Press Start recording before your meeting begins. The conversation will appear here as people speak.")
 
-        chat_ready = has_text and not busy and self.chat is not None
+        chat_ready = has_text and not live_here and self.chat is not None
         if not chat_ready:
             self.c_stack.set_visible_child_name("locked")
         elif self.chat.messages or chatting:
@@ -1002,9 +1269,9 @@ class Window(Adw.ApplicationWindow):
 
     # --- recording -------------------------------------------------
     def on_start_stop(self, _btn):
-        if self.proc is None:
+        if self.rec is None:
             self.start()
-        elif not self.retranscribing:
+        else:
             self.stop()
 
     def worker_cmd(self):
@@ -1018,10 +1285,11 @@ class Window(Adw.ApplicationWindow):
         return cmd
 
     def start(self):
-        if self.proc is not None:
+        if self.rec is not None:
             return
         self.flush_transcript_save()
         self.stop_playback()
+        self.close_search()
         cfg = self.current_settings()
         self.settings_expander.set_expanded(False)
         if not cfg["system"] and not cfg["mic"]:
@@ -1038,29 +1306,11 @@ class Window(Adw.ApplicationWindow):
         save_settings(cfg)
         engine, model = chosen.engine, chosen.model
         self.run_model = chosen.id
+        self.switching = None
         self.leave_version()
-        self.out_dir = MEETINGS_DIR / time.strftime("%Y-%m-%d_%H%M%S")
-        meetings.save_meta(self.out_dir, started=datetime.datetime.now().isoformat(timespec="seconds"),
-                           engine=engine)
-        self.chat = None
-        self.speaker_map = {}
-        self.live_names = {}
-        self.segments = []
-        self.bookmarks = []
-        self.render_bookmarks()
-        self.clear_chat_view()
-        self.loading_transcript = True
-        self.clear_bulk()
-        self.t_buf.set_text("")
-        self.loading_transcript = False
-        self.peaks = {"them": 0.0, "you": 0.0}
-        self.heard = {"them": False, "you": False}
-        self.last_error = None
-        self.deferred = False
-        self.retranscribing = False
-        self.banner.set_revealed(False)
-        self.stack.set_visible_child_name("transcript")
-        cmd += ["--out", str(self.out_dir), "--engine", engine, "--live", "--control"]
+        folder = MEETINGS_DIR / time.strftime("%Y-%m-%d_%H%M%S")
+        meetings.save_meta(folder, started=datetime.datetime.now().isoformat(timespec="seconds"), engine=engine)
+        cmd += ["--out", str(folder), "--engine", engine, "--live", "--control"]
         if engine == "whisper":
             cmd += ["--model", model, "--language", cfg["language"]]
         if not cfg["system"]:
@@ -1069,99 +1319,165 @@ class Window(Adw.ApplicationWindow):
             cmd.append("--no-mic")
         if os.environ.get("MINTOMEET_SYSTEM_SOURCE"):
             cmd += ["--system-source", os.environ["MINTOMEET_SYSTEM_SOURCE"]]
-        if not self.launch(cmd):
-            return
+        self.peaks = {"them": 0.0, "you": 0.0}
+        self.heard = {"them": False, "you": False}
+        self.deferred = False
+        self.rec_phase = "loading"
         self.record_start = time.monotonic()
         self.timer_label.set_text("00:00:00")
+        self.out_dir = folder       # show the new meeting (before the job exists, so its first lines land here)
+        job = self.jobs.record(folder, cmd, chosen.id, cfg["language"] if engine == "whisper" else None,
+                               prefs()["speakers"])
+        if job is None:
+            self.set_state("error", "Could not start the recorder.")
+            return
+        self.chat = None
+        self.speaker_map = {}
+        self.live_names = job.live_names
+        self.segments = []
+        self.bookmarks = []
+        self.render_bookmarks()
+        self.clear_chat_view()
+        self.loading_transcript = True
+        self.clear_bulk()
+        self.t_buf.set_text("")
+        self.loading_transcript = False
+        self.banner.set_revealed(False)
+        self.stack.set_visible_child_name("transcript")
         self.set_state("loading")
         self.update_title()
         self.refresh_sidebar()
+        self.update_jobs_button()
 
-    def launch(self, cmd):
-        try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
-        except OSError as e:
-            self.set_state("error", f"Could not start the recorder: {e}")
-            return False
-        threading.Thread(target=self.read_output, args=(self.proc,), daemon=True).start()
-        self.usage = procstats.Usage(self.proc.pid)
-        self.switching = None
+    def watch_usage(self, job):
+        """Measure this job's recorder for the CPU / memory meters (None hides them)."""
+        proc = job.proc if job is not None else None
+        self.usage_box.set_visible(proc is not None)
+        if proc is None:
+            self.usage_job = None
+            return
+        if self.usage_job is job and self.usage is not None and self.usage.pid == proc.pid:
+            return
+        self.usage_job = job
+        self.usage = procstats.Usage(proc.pid)
         for bar, note in ((self.cpu_bar, self.cpu_note), (self.mem_bar, self.mem_note)):
             bar.set_value(0)
             note.set_text("measuring…")
         self.sys_note.set_text("")
-        return True
 
     def stop(self):
-        if self.proc is None or self.retranscribing:
+        """Stop recording. What's left is transcribed in the background; the window is free at once."""
+        job = self.rec
+        if job is None:
             return
         self.banner.set_revealed(False)
-        self.set_state("finishing", "Stopping the recording…")
-        self.progress.set_fraction(0)
-        self.progress.set_text("Preparing…")
-        self.proc.send_signal(signal.SIGTERM)
+        try:
+            meetings.save_meta(job.folder, duration=int(time.monotonic() - self.record_start))
+        except OSError:
+            pass
+        self.switching = None
+        self.jobs.stop_capture(job)
 
-    def read_output(self, proc):
-        for line in proc.stdout:
-            GLib.idle_add(self.on_line, line.rstrip("\n"))
-        proc.wait()
-        GLib.idle_add(self.on_exit, proc, proc.returncode)
-
-    def on_line(self, line):
+    # --- what the background transcriptions report -----------------------------------------------------
+    def on_job_output(self, job, line):
+        """Every line a recorder prints. The recording's levels, phases and model switches drive the status card;
+        transcript lines appear when that meeting is on screen."""
+        capturing = job.state == "capturing"
+        here = job.folder == self.out_dir
         if line.startswith("LEVEL: "):
-            for part in line[7:].split():
-                key, _, val = part.partition("=")
-                if key in self.peaks:
-                    self.update_meter(key, float(val))
-        elif line.startswith("STATE: "):
+            if capturing:
+                for part in line[7:].split():
+                    key, _, val = part.partition("=")
+                    if key in self.peaks:
+                        self.update_meter(key, float(val))
+        elif line.startswith("STATE: ") and capturing:
             words = line[7:].split()
             word, opts = words[0], dict(w.split("=", 1) for w in words[1:] if "=" in w)
-            if word == "downloading" and (self.state in ("loading", "downloading") or self.retranscribing):
-                if not self.retranscribing:
-                    self.set_state("downloading")
+            if word == "downloading":
+                self.rec_phase = "downloading"
+                self.set_state("downloading")
                 if "pct" in opts:
                     self.progress.set_fraction(int(opts["pct"]) / 100)
                     self.progress.set_text(f"Downloading a speech model: {opts['pct']}%")
                 else:
                     self.progress.pulse()
                     self.progress.set_text("Downloading a speech model…")
-            elif word == "loading" and self.state == "downloading":
+            elif word == "loading" and self.rec_phase == "downloading":
+                self.rec_phase = "loading"
                 self.set_state("loading")
-            elif word == "loading" and self.state == "finishing":
-                self.status_detail.set_text("Loading the speech model…")
             elif word == "recording" and "deferred" in words:
                 self.deferred = True
+                self.rec_phase = "recording"
                 self.set_state("recording", "Recording. Whisper will transcribe after you stop, so your computer "
                                             "stays fast during the call.")
-            elif word == "recording" and self.state in ("loading", "downloading", "recording"):
+            elif word == "recording":
                 backlog = int(opts.get("backlog", 0))
+                was = self.rec_phase
+                self.rec_phase = "recording"
                 if backlog > 3:
                     lighter = (" A lighter model catches up faster: click the model tag to switch."
                                if (self.run_model or "").startswith("whisper") else "")
                     self.set_state("recording", f"Transcription is {backlog} segments behind. It will catch up; "
                                                 f"nothing is lost.{lighter}")
-                elif self.state != "recording" or self.status_detail.get_text().startswith("Transcription is"):
+                elif was != "recording" or self.status_detail.get_text().startswith("Transcription is"):
                     self.set_state("recording")
-            elif word == "finishing" and "speakers" in words:
-                self.progress.pulse()
-                self.progress.set_text("Telling speakers apart…")
-            elif word == "finishing":
-                done, total = int(opts.get("done", 0)), int(opts.get("total", 0))
-                if self.state != "finishing":
-                    self.set_state("finishing")
-                self.status_detail.set_text("Please keep MintoMeet open until it's done.")
-                self.progress.set_fraction(done / total if total else 1)
-                self.progress.set_text(f"Transcribed {done} of {total} speech segments")
         elif line.startswith("SWITCH: "):
-            self.on_switch(line[8:].split(" ", 2))
+            if capturing:
+                self.on_switch(line[8:].split(" ", 2))
         elif line.startswith("NOTICE: "):
-            self.toast(line[8:])
-        elif line.startswith("ERROR: "):
-            self.last_error = line[7:]
-        elif LINE_RE.match(line):
+            if (here or capturing) and not line.startswith("NOTICE: Your previous transcript"):
+                self.toast(line[8:])
+        elif LINE_RE.match(line) and here and job.kind == "recording":
             self.append_transcript_line(line, live=True)
             self.refresh_buttons()
+        return False
+
+    def on_job_change(self, job):
+        """A transcription started, progressed, paused or finished: update its row, the header and the card."""
+        label = self.row_info.get(job.folder)
+        if label is not None and job.active:
+            label.set_text(job.status() + (f" · {datasize.fmt(datasize.meeting(job.folder)['total'])}"
+                                           if self.show_sizes and job.state != "capturing" else ""))
+        if job.state == "capturing":
+            pass        # the recorder's own lines drive the status card
+        elif job.folder == self.out_dir or (self.rec is None and self.state in ("downloading", "loading", "recording")):
+            self.set_state(self.state)
+        self.update_jobs_button()
+        if self.jobs_popover.get_visible():
+            self.fill_jobs_popover()
+
+    def on_job_finished(self, job):
+        here = job.folder == self.out_dir
+        title = meetings.title(job.folder)
+        if job.state == "done":
+            self.learn_from_map(job.folder)
+            if here:
+                self.show_transcript_file(job.folder)
+                self.chat = chat.Chat(job.folder)
+                self.render_chat()
+                if job.kind == "again":
+                    self.set_state("done", "Transcribed again. Your previous transcript is kept: open it from the "
+                                           "“Transcribed with” tag above the transcript.")
+                elif self.t_text().strip():
+                    self.set_state("done", f"Saved in {self.short(job.folder)}. Open “Ask Agent” to summarize "
+                                           "it, list action items or ask questions.")
+                else:
+                    self.set_state("done", "No speech was detected. Next time, check the level meters to confirm "
+                                           "the meeting audio is coming through.")
+            else:
+                self.toast(f"“{title}” is transcribed.", "Open", lambda f=job.folder: self.load_folder(f))
+            if self.hooks and not self.is_visible():
+                self.hooks.notify(f"“{title}” is transcribed", "Open MintoMeet to read it or ask about it.")
+        elif job.state == "cancelled":
+            if here:
+                self.load_folder(job.folder) if chat.transcript_path(job.folder) else self.new_meeting()
+                self.set_state("done", "Stopped transcribing again. The meeting keeps the transcript it had.")
+        elif job.error and not here:
+            self.toast(f"Transcribing “{title}” stopped: {job.error}", "Open", lambda f=job.folder: self.load_folder(f))
+        elif here:
+            self.set_state(self.state)
+        self.refresh_sidebar()
+        self.update_jobs_button()
         return False
 
     def update_meter(self, key, rms):
@@ -1174,56 +1490,116 @@ class Window(Adw.ApplicationWindow):
         elif not self.heard[key]:
             note.set_text("silent")
 
-    def on_exit(self, proc, code):
-        if proc is not self.proc:
-            return False
-        self.proc = None
-        self.switching = None
-        try:
-            proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-        again = self.retranscribing
-        self.retranscribing = False
-        self.banner.set_revealed(False)
-        if not again and self.out_dir is not None and self.out_dir.exists():
-            meetings.save_meta(self.out_dir, duration=int(time.monotonic() - self.record_start))
-        if self.last_error:
-            self.set_state("error", self.last_error)
-            if again:
-                self.show_transcript_file(self.out_dir)
-        elif code == 0 and (self.out_dir / "transcript.txt").exists():
-            self.show_transcript_file(self.out_dir)
-            self.learn_from_map()
-            self.chat = chat.Chat(self.out_dir)
-            self.render_chat()
-            if again:
-                self.set_state("done", "Transcribed again. Your previous transcript is kept: open it from the "
-                                       "“Transcribed with” tag above the transcript.")
-            elif self.t_text().strip():
-                self.set_state("done", f"Saved in {self.short(self.out_dir)}. Open “Ask Agent” to summarize "
-                                       "it, list action items or ask questions.")
-            else:
-                self.set_state("done", "No speech was detected. Next time, check the level meters to confirm "
-                                       "the meeting audio is coming through.")
-        elif code == 0:
-            self.set_state("cancelled", f"Stopped before the speech model was ready. The audio is saved in "
-                                        f"{self.short(self.out_dir)}.")
-        else:
-            self.set_state("error", f"The recorder stopped unexpectedly (exit code {code}).")
-        self.update_title()
-        self.refresh_sidebar()
-        if self.quit_after_stop:
-            self.quit_after_stop = False
-            if self.hooks:
-                self.hooks.quit_now()
-            else:
-                self.destroy()
-        return False
+    # --- your controls for transcriptions --------------------------------------------------------------
+    def toggle_pause(self, job):
+        if job is None:
+            return
+        if job.state in ("paused",) or job.error:
+            self.jobs.resume(job)
+        elif self.jobs.can_pause(job):
+            self.jobs.pause(job)
+
+    def confirm_cancel(self, job):
+        if job is None or job.kind != "again":
+            return
+        dialog = Adw.AlertDialog(heading=f"Stop transcribing “{meetings.title(job.folder)}” again?",
+                                 body="What it has done so far is thrown away. The meeting keeps the transcript it "
+                                      "had before.")
+        dialog.add_response("keep", "Keep going")
+        dialog.add_response("stop", "Stop")
+        dialog.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("keep")
+        dialog.connect("response", lambda _d, r: r == "stop" and self.jobs.cancel(job))
+        self.cancel_dialog = dialog
+        dialog.present(self)
+
+    def update_jobs_button(self):
+        """The header button: how many meetings are being transcribed (or wait, or are paused)."""
+        active = [j for j in self.jobs.all() if j.state != "capturing"]
+        self.jobs_btn.set_visible(bool(active))
+        if not active:
+            self.jobs_popover.popdown()
+            return
+        running = sum(1 for j in active if j.state in ("running", "pausing"))
+        self.jobs_content.set_label(f"Transcribing {running}" if running else
+                                    f"{len(active)} paused" if all(j.state == "paused" for j in active) else
+                                    f"{len(active)} waiting")
+        self.jobs_content.set_icon_name("media-playback-pause-symbolic" if not running else
+                                        "document-open-recent-symbolic")
+        self.jobs_btn.update_property([Gtk.AccessibleProperty.LABEL],
+                                      [f"Transcriptions: {running} running, {len(active) - running} waiting or paused"])
+
+    def fill_jobs_popover(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, width_request=380)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(10)
+        head = Gtk.Label(label="Transcriptions", xalign=0)
+        head.add_css_class("heading")
+        box.append(head)
+        limit = self.jobs.limit()
+        note = Gtk.Label(xalign=0, wrap=True, label=f"Up to {limit} meeting{'s' if limit != 1 else ''} at once on "
+                                                    "this computer; the others wait their turn. Change it in "
+                                                    "Preferences.")
+        note.add_css_class("dim-label")
+        note.add_css_class("caption")
+        box.append(note)
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+        for job in self.jobs.all():
+            if job.state == "capturing":
+                continue
+            row = Gtk.ListBoxRow(activatable=True)
+            row.folder = job.folder
+            line = Gtk.Box(spacing=8, margin_top=8, margin_bottom=8, margin_start=10, margin_end=6)
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
+            name = Gtk.Label(label=meetings.title(job.folder), xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            name.add_css_class("heading")
+            what = "Again with" if job.kind == "again" else "With"
+            info = Gtk.Label(label=f"{job.status()} · {what} {meetings.model_name(job.model_id)}", xalign=0,
+                             wrap=True)
+            info.add_css_class("dim-label")
+            info.add_css_class("caption")
+            texts.append(name)
+            texts.append(info)
+            if job.total:
+                texts.append(Gtk.ProgressBar(fraction=job.fraction))
+            line.append(texts)
+            paused = job.state == "paused" or bool(job.error)
+            btn = Gtk.Button(icon_name="media-playback-start-symbolic" if paused else "media-playback-pause-symbolic",
+                             valign=Gtk.Align.CENTER, sensitive=job.state in ("queued", "running", "paused"))
+            btn.add_css_class("flat")
+            btn.set_tooltip_text("Resume" if paused else "Pause")
+            btn.update_property([Gtk.AccessibleProperty.LABEL],
+                                [f"{'Resume' if paused else 'Pause'} {meetings.title(job.folder)}"])
+            btn.connect("clicked", lambda _b, j=job: self.toggle_pause(j))
+            line.append(btn)
+            if job.kind == "again":
+                stop = Gtk.Button(icon_name="process-stop-symbolic", valign=Gtk.Align.CENTER)
+                stop.add_css_class("flat")
+                stop.set_tooltip_text("Stop transcribing again")
+                stop.update_property([Gtk.AccessibleProperty.LABEL], [f"Stop {meetings.title(job.folder)}"])
+                stop.connect("clicked", lambda _b, j=job: (self.jobs_popover.popdown(), self.confirm_cancel(j)))
+                line.append(stop)
+            row.set_child(line)
+            listbox.append(row)
+        listbox.connect("row-activated", lambda _l, r: (self.jobs_popover.popdown(), self.load_folder(r.folder)))
+        box.append(listbox)
+        actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        if any(self.jobs.can_pause(j) for j in self.jobs.all()):
+            b = Gtk.Button(label="Pause all")
+            b.connect("clicked", lambda _b: [self.jobs.pause(j) for j in self.jobs.all() if self.jobs.can_pause(j)])
+            actions.append(b)
+        if any(j.state == "paused" for j in self.jobs.all()):
+            b = Gtk.Button(label="Resume all")
+            b.connect("clicked", lambda _b: [self.jobs.resume(j) for j in self.jobs.all() if j.state == "paused"])
+            actions.append(b)
+        box.append(actions)
+        self.jobs_popover.set_child(box)
 
     def update_usage(self):
         """Show how much CPU and memory the recorder (and the tools it started) is using right now."""
-        if self.usage is None or self.proc is None or self.usage.pid != self.proc.pid:
+        job = self.usage_job
+        if self.usage is None or job is None or job.proc is None or self.usage.pid != job.proc.pid:
             return
         s = self.usage.sample()
         if s is None:
@@ -1249,12 +1625,12 @@ class Window(Adw.ApplicationWindow):
         self.sys_note.add_css_class("warning" if low_mem or busy else "dim-label")
 
     def on_tick(self):
-        if self.proc is not None:
+        if self.usage_job is not None:
             self.update_usage()
             if self.show_sizes and int(time.monotonic()) % 5 == 0:
                 self.update_meeting_size()      # the recording grows
                 self.update_size_summary()
-        if self.proc is not None and not self.retranscribing and self.state in ("downloading", "loading", "recording"):
+        if self.rec is not None:
             elapsed = int(time.monotonic() - self.record_start)
             self.timer_label.set_text(meetings.fmt_time(elapsed))
             if elapsed >= NO_AUDIO_AFTER:
@@ -1275,9 +1651,17 @@ class Window(Adw.ApplicationWindow):
         while (child := self.meeting_list.get_first_child()) is not None:
             self.meeting_list.remove(child)
         folders = meetings.list_meetings(MEETINGS_DIR)
-        live = self.out_dir if self.proc is not None and not self.retranscribing else None
+        rec = self.rec
+        live = rec.folder if rec is not None else None
         if live is not None and live not in folders:
             folders.insert(0, live)
+        for job in self.jobs.all():        # a recording paused before any speech has no transcript yet
+            if job.folder not in folders and job.folder.is_dir():
+                folders.append(job.folder)
+        self.row_info = {}
+        self.tag_filter.set_tags(meetings.count_tags(meetings.tags(f) for f in folders))
+        every = len(folders)
+        folders = [f for f in folders if f == live or self.tag_filter.accepts(f)]
         for folder in folders:
             row = Gtk.ListBoxRow()
             row.folder = folder
@@ -1285,34 +1669,44 @@ class Window(Adw.ApplicationWindow):
             texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
             name = Gtk.Label(label=meetings.title(folder), xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
             name.add_css_class("heading")
-            text = "Recording now…" if folder == live else meetings.describe(folder)
-            if self.show_sizes:
+            job = self.jobs.get(folder)
+            text = job.status() if job is not None and job.state != "queued" or folder == live else \
+                meetings.describe(folder) + (" · waiting to transcribe" if job is not None else "")
+            if self.show_sizes and folder != live:
                 text += f" · {datasize.fmt(datasize.meeting(folder)['total'])}"
             info = Gtk.Label(label=text, xalign=0, wrap=True)
             info.add_css_class("dim-label")
             info.add_css_class("caption")
             texts.append(name)
             texts.append(info)
+            if job is not None:
+                self.row_info[folder] = info
+            tags = meetings.tags(folder)
+            if tags:
+                texts.append(tagsui.pill_row(tags, matches=[t for t in tags if t.casefold() in self.tag_filter.selected]))
             box.append(texts)
             trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
             trash.add_css_class("flat")
             trash.set_tooltip_text("Move this meeting to the Trash")
             trash.update_property([Gtk.AccessibleProperty.LABEL], [f"Delete {meetings.title(folder)}"])
             trash.connect("clicked", lambda _b, f=folder: self.confirm_delete(f))
-            trash.set_sensitive(folder != live)
+            trash.set_sensitive(job is None)
+            if job is not None:
+                trash.set_tooltip_text("It's being transcribed. Stop or finish that first.")
             box.append(trash)
             row.set_child(box)
             self.meeting_list.append(row)
             if self.out_dir is not None and folder == self.out_dir:
                 self.meeting_list.select_row(row)
+        self.meeting_empty.set_label("No meetings have all the chosen tags." if every and not folders else
+                                     "Your recorded meetings will appear here.")
         self.meeting_empty.set_visible(not folders)
         self.update_size_summary()
 
     def on_meeting_row(self, _list, row):
-        if self.proc is not None:
-            self.toast("Stop the recording first.")
-            return
-        self.load_folder(row.folder)
+        if row.folder != self.out_dir:
+            self.load_folder(row.folder)
+        self.close_search()
         if self.split.get_collapsed():
             self.split.set_show_sidebar(False)
 
@@ -1340,10 +1734,11 @@ class Window(Adw.ApplicationWindow):
         self.toast("Moved to the Trash")
 
     def new_meeting(self):
-        if self.proc is not None:
+        if self.rec is not None:
             return
         self.flush_transcript_save()
         self.stop_playback()
+        self.close_search()
         self.leave_version()
         self.out_dir = None
         self.chat = None
@@ -1363,6 +1758,14 @@ class Window(Adw.ApplicationWindow):
 
     def update_title(self):
         self.title_label.set_text(meetings.title(self.out_dir) if self.out_dir is not None else "New meeting")
+        if self.tag_editor.folder != self.out_dir:
+            self.tag_editor.set_folder(self.out_dir)
+
+    def open_manage_tags(self):
+        def changed():
+            self.tag_editor.set_folder(self.out_dir)
+            self.refresh_sidebar()
+        tagsui.ManageTagsDialog(MEETINGS_DIR, on_changed=changed).present(self)
 
     def on_title_editing(self, label, _param):
         if label.get_editing() or self.out_dir is None:
@@ -1398,6 +1801,26 @@ class Window(Adw.ApplicationWindow):
             mark = self.t_buf.get_mark("live-end") or self.t_buf.create_mark("live-end", end(), False)
             self.t_buf.move_mark(mark, end())
             self.t_view.scroll_to_mark(mark, 0.0, False, 0.0, 0.0)
+
+    def show_job_lines(self, job):
+        """A recording still being transcribed: the lines done so far, with the speaker names you gave."""
+        self.flush_transcript_save()
+        self.leave_version()
+        self.loading_transcript = True
+        self.clear_bulk()
+        self.t_buf.set_text("")
+        self.loading_transcript = False
+        self.speaker_map = self.load_speaker_map(job.folder)
+        self.segments = self.load_segments(job.folder)
+        for line in job.lines or meetings.partial_lines(job.folder):
+            m = LINE_RE.match(line)
+            name = self.speaker_map.get(self.line_key(m.group(1), m.group(3))) if m else None
+            if name and name != m.group(2) and BASE_LABEL_RE.match(m.group(2)):
+                line = f"[{m.group(1)}] {name}: {m.group(3)}"
+            self.append_transcript_line(line)
+        self.t_buf.set_enable_undo(False)
+        self.t_buf.set_enable_undo(True)
+        self.save_status.set_text("")
 
     def show_transcript_file(self, folder):
         self.flush_transcript_save()
@@ -1440,15 +1863,21 @@ class Window(Adw.ApplicationWindow):
         self.update_meeting_size()
         tag = self.model_tag
         tag.remove_css_class("earlier")
-        if self.proc is not None and self.state in RECORDING_STATES:
-            name = meetings.model_name(self.run_model)
-            if self.retranscribing:
-                text = f"Transcribing again with {name}"
-            elif self.deferred and self.state != "finishing":
+        job = self.vjob
+        if job is not None:
+            capturing = job.state == "capturing"
+            name = meetings.model_name(self.run_model if capturing else job.model_id)
+            if capturing and self.deferred:
                 text = f"Recording · {name} transcribes after you stop"
+            elif job.state == "paused":
+                text = f"Paused · {name}"
+            elif job.state == "queued":
+                text = f"Waiting · {name}"
+            elif job.kind == "again":
+                text = f"Transcribing again with {name}"
             else:
                 text = f"Transcribing with {name}"
-            live = not self.retranscribing and self.state == "recording" and not self.deferred
+            live = capturing and self.rec_phase == "recording" and not self.deferred
             if live and self.switching:
                 mid, progress = self.switching
                 text += f" · switching to {meetings.model_name(mid)}{progress}"
@@ -1474,7 +1903,7 @@ class Window(Adw.ApplicationWindow):
         tag.set_visible(True)
 
     def fill_version_popover(self, *_):
-        if self.proc is not None and not self.retranscribing:
+        if self.rec is not None and self.vjob is self.rec:
             self.fill_switch_popover()
             return
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, width_request=320)
@@ -1539,7 +1968,7 @@ class Window(Adw.ApplicationWindow):
 
     def show_version(self, version):
         """Show an earlier transcript read-only (None: back to the current one)."""
-        if self.out_dir is None or self.proc is not None:
+        if self.out_dir is None or self.vjob is not None:
             return
         if version is None:
             if self.viewing is not None:
@@ -1622,15 +2051,16 @@ class Window(Adw.ApplicationWindow):
 
     def request_switch(self, mid, language):
         """Ask the running recorder to change speech model; capture carries on uninterrupted."""
-        if self.proc is None or self.retranscribing or self.switching is not None:
+        rec = self.rec
+        if rec is None or rec.proc is None or self.switching is not None:
             return
         m = modelcatalog.get(mid)
         if m is None or m not in self.models or mid == self.run_model:
             return      # only downloaded models: the recorder mustn't start a big download mid-meeting
         engine, model = m.engine, m.model
         try:
-            self.proc.stdin.write(f"ENGINE {engine} {model or '-'} {language or '-'}\n")
-            self.proc.stdin.flush()
+            rec.proc.stdin.write(f"ENGINE {engine} {model or '-'} {language or '-'}\n")
+            rec.proc.stdin.flush()
         except (OSError, ValueError) as e:
             self.toast(f"Couldn't switch the model: {e}")
             return
@@ -1670,7 +2100,7 @@ class Window(Adw.ApplicationWindow):
 
     def restore_viewed_version(self):
         v = self.viewing
-        if v is None or self.out_dir is None or self.proc is not None:
+        if v is None or self.out_dir is None or self.vjob is not None:
             return
         old = meetings.model_name(meetings.current_model(self.out_dir)[0])
         try:
@@ -1686,6 +2116,7 @@ class Window(Adw.ApplicationWindow):
                    "earlier version.")
 
     def on_transcript_edited(self, _buf):
+        self.schedule_find()        # offsets moved: highlight the find bar's matches again
         if self.loading_transcript or not self.t_view.get_editable():
             return
         self.save_status.set_text("Saving…")
@@ -1836,16 +2267,20 @@ class Window(Adw.ApplicationWindow):
 
     # --- bookmarks -------------------------------------------------------
     def add_bookmark(self):
-        if self.proc is None or self.retranscribing or self.state not in ("downloading", "loading", "recording"):
+        rec = self.rec
+        if rec is None:
             return
         t = round(time.monotonic() - self.record_start, 1)
-        self.bookmarks.append({"t": t, "note": ""})
+        here = rec.folder == self.out_dir
+        marks = self.bookmarks if here else meetings.load_bookmarks(rec.folder)
+        marks.append({"t": t, "note": ""})
         try:
-            self.out_dir.mkdir(parents=True, exist_ok=True)
-            meetings.save_bookmarks(self.out_dir, self.bookmarks)
+            rec.folder.mkdir(parents=True, exist_ok=True)
+            meetings.save_bookmarks(rec.folder, marks)
         except OSError as e:
             self.toast(f"Couldn't save the bookmark: {e}")
-        self.render_bookmarks()
+        if here:
+            self.render_bookmarks()
         self.toast(f"Bookmarked {meetings.fmt_time(t)}")
         if self.hooks:
             self.hooks.state_changed()
@@ -1910,12 +2345,30 @@ class Window(Adw.ApplicationWindow):
 
     def render_chat(self):
         self.clear_chat_view()
+        self.chat_widgets = []
         for m in self.chat.messages if self.chat else []:
             if m["role"] == "user":
                 self.add_user_bubble(m["text"])
             else:
                 set_markdown(self.add_assistant_bubble(m["text"], m.get("agent") or chat.CLAUDE), m["text"])
+            self.chat_widgets.append(self.msg_box.get_last_child())
         self.refresh_buttons()
+
+    def scroll_to_message(self, index):
+        """Show Ask Agent message `index` (as in chat.json), briefly highlighted."""
+        self.stack.set_visible_child_name("chat")
+        if not 0 <= index < len(self.chat_widgets):
+            return
+        widget = self.chat_widgets[index]
+
+        def go():
+            ok, point = widget.compute_point(self.msg_box, Graphene.Point())
+            if ok:
+                self.c_scroll.get_vadjustment().set_value(max(0, point.y - 12))
+            widget.add_css_class("search-flash")
+            GLib.timeout_add(2500, lambda: widget.remove_css_class("search-flash") or False)
+            return False
+        GLib.timeout_add(150, go)       # after the chat has been laid out (and scroll_chat has run)
 
     def add_user_bubble(self, text):
         label = Gtk.Label(label=text, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, xalign=0, selectable=True,
@@ -2085,9 +2538,6 @@ class Window(Adw.ApplicationWindow):
         storage.StorageDialog(MEETINGS_DIR, open_meeting=self.open_from_storage).present(self)
 
     def open_from_storage(self, folder):
-        if self.proc is not None:
-            self.toast("Stop the recording first.")
-            return
         self.load_folder(folder)
 
     # --- speech model library --------------------------------------------------------
@@ -2100,9 +2550,11 @@ class Window(Adw.ApplicationWindow):
 
     def model_in_use(self, model_id):
         """Why a model can't be deleted right now (shown as "In use"), or ""."""
-        if self.proc is not None and model_id in (self.run_model or "").split("+") + \
-                [self.switching[0] if self.switching else None]:
-            return "It's transcribing right now. You can delete it after the recording."
+        busy = self.jobs.models_in_use()
+        if self.rec is not None:
+            busy |= set((self.run_model or "").split("+")) | {self.switching[0] if self.switching else None}
+        if model_id in busy:
+            return "It's transcribing right now. You can delete it when that has finished."
         return ""
 
     def model_cannot_go(self, model_id):
@@ -2427,7 +2879,7 @@ class Window(Adw.ApplicationWindow):
             if SPEAKER_N_RE.match(current):
                 targets = [n for n in range(self.t_buf.get_line_count())
                            if (i := self.line_info(n)) is not None and i[2].group(2) == current]
-                if self.proc is not None and not self.retranscribing:
+                if self.vjob is not None and self.vjob.kind == "recording":
                     self.live_names[current] = name     # later lines from this voice follow your choice
             else:
                 n = line + 1
@@ -2479,7 +2931,7 @@ class Window(Adw.ApplicationWindow):
         targets = self.speaker_lines(old)
         if not targets or old == new:
             return
-        if self.proc is not None and not self.retranscribing:
+        if self.vjob is not None and self.vjob.kind == "recording":
             # while recording, lines that still arrive under the old name (or under a voice you had
             # pointed at it) follow the change too; "You"/"Them" are whole streams, so they don't
             for label, named in list(self.live_names.items()):
@@ -2491,26 +2943,30 @@ class Window(Adw.ApplicationWindow):
         count = f"{len(targets)} line{'s' if len(targets) > 1 else ''}"
         self.assign_speaker(targets, new, message=f"Replaced “{old}” with {who} on {count}")
 
-    def voice_samples(self, stamp, text):
-        """The recorded segment behind a transcript line as a voice clip (see voices.clip), if any."""
+    def voice_samples(self, stamp, text, segments=None, folder=None):
+        """The recorded segment behind a transcript line as a voice clip (see voices.clip), if any. Defaults to
+        the meeting on screen."""
+        segments = self.segments if segments is None else segments
+        folder = self.out_dir if folder is None else folder
         t = secs(stamp)
-        for g in self.segments:
+        for g in segments:
             if int(g["start"]) == t and g.get("emb") and g["text"].strip()[:40] == text.strip()[:40]:
-                if self.out_dir is None:
+                if folder is None:
                     return [(g["emb"], g["end"] - g["start"])]
-                return [voices.clip(self.out_dir.name, g.get("stream", "Them"), g["start"], g["end"], g["text"], g["emb"])]
+                return [voices.clip(folder.name, g.get("stream", "Them"), g["start"], g["end"], g["text"], g["emb"])]
         return []
 
-    def learn_from_map(self):
-        """After a meeting, learn the voices of people you named during it (clips already learned while
-        naming them are recognised as the same and not counted twice)."""
+    def learn_from_map(self, folder):
+        """After a meeting is transcribed, learn the voices of people you named in it (clips already learned
+        while naming them are recognised as the same and not counted twice)."""
         voices.migrate(MEETINGS_DIR)
+        segments = self.load_segments(folder)
         by_name = {}
-        for key, name in self.speaker_map.items():
+        for key, name in self.load_speaker_map(folder).items():
             if name in ("You", "Them") or "|" not in key:
                 continue
             stamp, text = key.split("|", 1)
-            by_name.setdefault(name, []).extend(self.voice_samples(stamp, text))
+            by_name.setdefault(name, []).extend(self.voice_samples(stamp, text, segments, folder))
         for name, samples in by_name.items():
             if samples:
                 voices.learn(name, samples)
@@ -2581,7 +3037,7 @@ class Window(Adw.ApplicationWindow):
     def build_audio_export_group(self):
         group = Adw.PreferencesGroup(title="Audio")
         have = [kind for name, kind in meetings.AUDIO_FILES if (self.out_dir / name).exists()]
-        recording = self.proc is not None and not self.retranscribing
+        recording = self.vjob is not None and self.vjob.kind == "recording"
         row = Adw.ActionRow(title="One mixed audio file (.mp3)")
         row.set_subtitle_lines(0)
         if recording:
@@ -2718,7 +3174,7 @@ class Window(Adw.ApplicationWindow):
 
     # --- transcribe again -----------------------------------------------------
     def open_retranscribe_dialog(self):
-        if self.out_dir is None or self.proc is not None:
+        if self.out_dir is None or self.vjob is not None:
             return
         minutes = max(1, round(meetings.duration(self.out_dir) / 60))
         dialog = Adw.Dialog(title="Transcribe again", content_width=480)
@@ -2770,33 +3226,23 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
     def start_retranscribe(self, model_id, language):
-        if self.out_dir is None or self.proc is not None:
+        """Transcribe the meeting on screen again, in the background (it waits if others are running)."""
+        folder = self.out_dir
+        chosen = modelcatalog.get(model_id)
+        if folder is None or self.vjob is not None or chosen is None:
             return
-        cmd = self.worker_cmd()
-        if cmd is None:
+        if not (APP_DIR / "venv/bin/python").exists():
+            self.set_state("error", "The speech engine isn't installed. Run install.sh in the mintomeet folder.")
             return
         self.flush_transcript_save()
         self.stop_playback()
-        chosen = modelcatalog.get(model_id)
-        engine, model = chosen.engine, chosen.model
-        self.run_model = chosen.id
         self.leave_version()
-        cmd += ["--retranscribe", str(self.out_dir), "--engine", engine]
-        if engine == "whisper":
-            cmd += ["--model", model, "--language", language]
-        self.retranscribing = True
-        self.last_error = None
-        self.deferred = False
-        self.loading_transcript = True
-        self.clear_bulk()
-        self.t_buf.set_text("")
-        self.loading_transcript = False
-        if not self.launch(cmd):
-            self.retranscribing = False
-            return
-        self.set_state("finishing", f"Using {chosen.name}. You can keep using your computer.")
-        self.progress.set_fraction(0)
-        self.progress.set_text("Starting…")
+        job = self.jobs.add(folder, chosen.id, language if chosen.engine == "whisper" else None, prefs()["speakers"])
+        if job.state == "queued":
+            self.toast(f"Waiting: {len(self.jobs.running())} other meetings are being transcribed. This one starts "
+                       "when there's room.")
+        self.set_state("job")
+        self.refresh_sidebar()
 
     # --- preferences -------------------------------------------------------
     def show_about(self):
@@ -2838,6 +3284,23 @@ class Window(Adw.ApplicationWindow):
         meet = Adw.PreferencesGroup(title="Meetings")
         meet.add(rows["detect_calls"])
         meet.add(rows["speakers"])
+        auto = jobs.auto_limit()
+        choices = [(f"Automatic ({auto} on this computer)", 0)] + [(str(n), n) for n in range(1, 5)]
+        parallel = Adw.ComboRow(title="Meetings transcribed at once",
+                                subtitle="More at once share the processor, so each one takes longer. The rest "
+                                         "wait their turn, and one only starts when there's enough free memory.",
+                                model=Gtk.StringList.new([label for label, _ in choices]))
+        parallel.set_subtitle_lines(0)
+        parallel.set_selected(next((i for i, (_l, n) in enumerate(choices) if n == p["parallel"]), 0))
+
+        def parallel_changed(row, _param):
+            new = prefs()
+            new["parallel"] = choices[row.get_selected()][1]
+            save_settings({"prefs": new})
+            self.jobs.limit_setting = new["parallel"]
+            self.jobs.schedule()
+        parallel.connect("notify::selected", parallel_changed)
+        meet.add(parallel)
         ai = Adw.PreferencesGroup(title="AI agent", description="Who answers in Ask Agent and in “mintomeet summarize”.")
         agent_row = Adw.ActionRow(title=agents.describe(self.agent_cfg), subtitle=agents.usage_note(self.agent_cfg),
                                   use_markup=False)
@@ -2873,14 +3336,20 @@ class Window(Adw.ApplicationWindow):
     def load_folder(self, folder):
         """Show an earlier meeting's transcript, chat and bookmarks."""
         folder = pathlib.Path(folder)
-        if chat.transcript_path(folder) is None:
+        job = self.jobs.get(folder)
+        if chat.transcript_path(folder) is None and job is None:
             self.toast("That folder has no transcript.")
             return False
         if self.chat is not None and self.chat.busy:
             self.chat.cancel()
+        self.flush_transcript_save()
         self.stop_playback()
         self.out_dir = folder
-        self.show_transcript_file(folder)
+        if job is not None and job.kind == "recording":
+            self.show_job_lines(job)        # what's transcribed so far; new lines keep arriving
+        else:
+            self.show_transcript_file(folder)
+        self.live_names = job.live_names if job is not None else {}
         self.chat = chat.Chat(folder)
         self.render_chat()
         self.bookmarks = meetings.load_bookmarks(folder)
@@ -2892,25 +3361,117 @@ class Window(Adw.ApplicationWindow):
         self.refresh_sidebar()
         return True
 
+    # --- search across meetings ------------------------------------
+    def set_search_button(self, on):
+        if self.search_btn.get_active() != on:
+            self.syncing_search = True
+            self.search_btn.set_active(on)
+            self.syncing_search = False
+
+    def on_search_toggled(self, btn):
+        if not self.syncing_search:
+            self.open_search() if btn.get_active() else self.close_search()
+
+    def open_search(self, text=None, keep_place=False):
+        self.flush_transcript_save()        # so the search sees your latest edits
+        self.main_stack.set_visible_child_name("search")
+        self.set_search_button(True)
+        self.results_btn.set_visible(False)
+        self.search_page.present_search(text, keep_place=keep_place)
+
+    def close_search(self):
+        self.main_stack.set_visible_child_name("meeting")
+        self.set_search_button(False)
+        self.came_from_search = False
+        self.results_btn.set_visible(False)
+
+    def open_search_meeting(self, doc, query):
+        self.go_to_result(doc, query)
+
+    def open_search_hit(self, doc, hit, query):
+        self.go_to_result(doc, query, hit)
+
+    def go_to_result(self, doc, query, hit=None):
+        """Open a search result's meeting and show the match: the transcript line (with the find bar on the
+        searched words), the bookmark, or the Ask Agent message."""
+        folder = doc.folder
+        if folder != self.out_dir or self.viewing is not None:
+            if not self.load_folder(folder):
+                return
+        self.main_stack.set_visible_child_name("meeting")
+        self.set_search_button(False)
+        self.came_from_search = True
+        self.results_btn.set_visible(True)
+        words = " ".join(f'"{t}"' if " " in t else t for t in query.terms)
+        if hit is None or hit.source == "transcript":
+            line = self.find_line(hit.when, hit.text) if hit is not None else None
+            if words:
+                self.open_find(words, line=line if line is not None else 0)
+            else:
+                self.find_bar.set_search_mode(False)
+                self.stack.set_visible_child_name("transcript")
+            if line is not None:
+                self.flash_line(line)
+        elif hit.source == "bookmark":
+            self.find_bar.set_search_mode(False)
+            self.jump_to(doc.bookmarks[hit.index].get("t", 0))
+        else:
+            self.find_bar.set_search_mode(False)
+            self.scroll_to_message(hit.index)
+
+    def find_line(self, stamp, text):
+        """The transcript line with this time and text (or, failing that, the first at this time)."""
+        first = None
+        for n in range(self.t_buf.get_line_count()):
+            info = self.line_info(n)
+            if info is None or info[2].group(1) != stamp:
+                continue
+            if info[2].group(3).strip() == text.strip():
+                return n
+            first = n if first is None else first
+        return first
+
+    def flash_line(self, n):
+        start = self.t_buf.get_iter_at_line(n)[1]
+        end = start.copy()
+        if not end.ends_line():
+            end.forward_to_line_end()
+        self.t_buf.apply_tag_by_name("flash", start, end)
+        self.scroll_transcript_to(start)
+        GLib.timeout_add(2500, lambda: self.t_buf.remove_tag_by_name(
+            "flash", self.t_buf.get_start_iter(), self.t_buf.get_end_iter()) or False)
+
     # --- closing ---------------------------------------------------
     def on_close_request(self, _win):
         self.flush_transcript_save()
+        busy = [j for j in self.jobs.all() if j.proc is not None]
         if self.hooks and self.hooks.runs_in_background():
             self.set_visible(False)         # keep running in the tray
-            if self.proc is not None:
+            if self.rec is not None:
                 self.hooks.notify("MintoMeet is still recording",
                                   "Use the MintoMeet icon in the top bar to stop or reopen the window.")
+            elif busy:
+                self.hooks.notify("MintoMeet keeps transcribing",
+                                  "You'll get a notification when it's done. Reopen it from the top bar icon.")
             return True
         if self.chat is not None and self.chat.busy:
             self.chat.cancel()
         self.stop_playback()
-        if self.proc is None or self.quit_after_stop:
+        if not busy or self.quitting:
             return False
-        dialog = Adw.AlertDialog(
-            heading="Recording in progress",
-            body="Closing now stops the recording. What has been said so far will still be transcribed and saved.")
-        dialog.add_response("keep", "Keep recording")
-        dialog.add_response("stop", "Stop and close")
+        if self.rec is not None:
+            heading = "Recording in progress"
+            body = ("Closing stops the recording. The audio is saved, and whatever isn't transcribed yet is "
+                    "transcribed the next time you open MintoMeet.")
+            keep, stop = "Keep recording", "Stop and close"
+        else:
+            heading = f"Transcribing {len(busy)} meeting{'s' if len(busy) != 1 else ''}"
+            body = ("Closing pauses the transcription. It carries on from where it stopped the next time you open "
+                    "MintoMeet.")
+            keep, stop = "Keep open", "Pause and close"
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("keep", keep)
+        dialog.add_response("stop", stop)
         dialog.set_response_appearance("stop", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.set_default_response("keep")
         dialog.set_close_response("keep")
@@ -2920,9 +3481,20 @@ class Window(Adw.ApplicationWindow):
         return True
 
     def on_quit_response(self, _dialog, response):
-        if response == "stop" and self.proc is not None:
-            self.quit_after_stop = True
-            self.stop()
+        if response == "stop":
+            self.quit_safely(lambda: self.hooks.quit_now() if self.hooks else self.destroy())
+
+    def quit_safely(self, then):
+        """Stop a recording (keeping its audio) and pause every transcription with its progress saved, then
+        `then`. Everything carries on from where it stopped the next time the app starts."""
+        self.quitting = True
+        rec = self.rec
+        if rec is not None:
+            try:
+                meetings.save_meta(rec.folder, duration=int(time.monotonic() - self.record_start))
+            except OSError:
+                pass
+        self.jobs.suspend_all(then)
 
 
 class App(Adw.Application):
@@ -2950,6 +3522,8 @@ class App(Adw.Application):
         self.set_accels_for_action("app.bookmark", ["<Control>b"])
         self.set_accels_for_action("app.preferences", ["<Control>comma"])
         self.set_accels_for_action("app.quit", ["<Control>q"])
+        self.set_accels_for_action("win.search", ["<Control><Shift>f", "<Control>k"])
+        self.set_accels_for_action("win.find", ["<Control>f"])
 
     def do_activate(self):
         if self.win is None:
@@ -2983,8 +3557,7 @@ class App(Adw.Application):
             self.tray.update(self.recording())
 
     def recording(self):
-        w = self.win
-        return w is not None and w.proc is not None and not w.retranscribing and w.state in RECORDING_STATES
+        return self.win is not None and self.win.rec is not None
 
     def notify(self, title, body, buttons=()):
         n = Gio.Notification.new(title)
@@ -3004,11 +3577,11 @@ class App(Adw.Application):
     def tray_items(self):
         w = self.win
         rec = self.recording()
-        can_toggle = w is not None and not w.retranscribing and w.state != "finishing"
+        can_toggle = w is not None
         return [("Open MintoMeet", True, self.show_window), None,
                 ("Stop recording" if rec else "Start recording", can_toggle,
                  self.stop_recording if rec else self.start_recording),
-                ("Bookmark this moment", rec and w.state == "recording", lambda: w.add_bookmark()), None,
+                ("Bookmark this moment", rec and w.rec_phase == "recording", lambda: w.add_bookmark()), None,
                 ("Quit MintoMeet", True, self.quit_all)]
 
     def show_window(self):
@@ -3017,7 +3590,7 @@ class App(Adw.Application):
             self.win.present()
 
     def start_recording(self):
-        if self.win is not None and self.win.proc is None:
+        if self.win is not None and self.win.rec is None:
             self.show_window()
             self.win.start()
 
@@ -3026,17 +3599,19 @@ class App(Adw.Application):
             self.win.stop()
 
     def quit_all(self):
-        if self.win is not None and self.win.proc is not None and not self.win.retranscribing:
-            self.win.quit_after_stop = True     # finish and save the transcript first
-            self.win.stop()
-            self.notify("Saving your meeting", "MintoMeet will close once the transcript is saved.")
+        w = self.win
+        if w is not None and any(j.proc is not None for j in w.jobs.all()):
+            if w.rec is not None:
+                self.notify("Saving your recording", "MintoMeet closes once the audio is saved. Whatever isn't "
+                                                     "transcribed yet carries on the next time you open it.")
+            w.quit_safely(self.quit_now)
             return
         self.quit_now()
 
     # --- call detection --------------------------------------------------------
     def on_call_start(self, app_name):
         self.call_app = app_name
-        if self.win is None or self.win.proc is not None:
+        if self.win is None or self.win.rec is not None:
             return
         self.notify(f"{app_name} is using your microphone", "Looks like a call. Record and transcribe it?",
                     [("Start recording", "app.start-recording")])
