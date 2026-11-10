@@ -6,6 +6,16 @@ All notable changes to MintoMeet are listed here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Search across all meetings** (Search button, Ctrl+Shift+F or Ctrl+K): finds words in transcripts, Ask Agent
+  conversations, bookmark notes, titles and tags, ignoring case and accents. Filter by people (only the lines they
+  said), tags, date (today, last 7 days, this month, a range…) and where to look; sort by best match or date.
+  Filters can also be typed (`from:`, `tag:`, `after:`, `before:`, `on:`, `in:`), and `"quotes"` find a phrase.
+  Results are grouped by meeting with the matching words highlighted; clicking one opens the meeting at that
+  line, bookmark or chat answer, and *Back to results* returns to the search.
+- **Find in this transcript** (Ctrl+F): every match highlighted, with next / previous (Enter / Shift+Enter).
+- **Tags for meetings**: add them under a meeting's title (suggestions from your other meetings), see them in
+  the meetings list, and filter the list by one or more tags. *☰ → Manage tags…* renames or merges a tag, or
+  deletes it from every meeting (with Undo). Exports list the meeting's tags.
 - **Choose your AI agent.** Ask Agent and `mintomeet summarize` can use Claude Code (still the default), OpenAI,
   the Anthropic API, Google Gemini, OpenRouter, Groq, Mistral, Together AI, Ollama or LM Studio on your own
   computer, or any OpenAI-compatible server. A new *AI agent* window (Preferences, or *Change…* in Ask Agent)

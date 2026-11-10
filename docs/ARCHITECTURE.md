@@ -13,6 +13,8 @@ detail.
 │   ├─ speakers.py     speaker list + "Speakers" dialog                             │
 │   ├─ voicereview.py  "Learned voices" dialog                                      │
 │   ├─ storage.py      "Storage" dialog            datasize.py  disk-usage figures  │
+│   ├─ searchpage.py   "Search" page               search.py   searching (pure)   │
+│   ├─ tagsui.py       tag pills, tag filter, "Manage tags" window                │
 │   ├─ modellibrary.py "Speech models" dialog + background model downloads         │
 │   ├─ chat.py         Ask Agent conversations (Claude Code CLI or an API agent)    │
 │   ├─ agents.py       AI agents: settings, OpenAI / Anthropic / Ollama streaming   │
@@ -89,6 +91,21 @@ files.
   versions/<stamp>/         earlier transcripts, each with version.json
   bookmarks.json, chat.json, chat.md
 ```
+
+`meeting.json` also holds the meeting's `tags` (a list; `meetings.tags()` / `set_tags()` keep them tidy:
+single spaces, no commas, no repeats that differ only in case).
+
+## Search
+
+`search.py` is pure Python and holds the whole library in memory: one `Doc` per meeting with its transcript
+lines, Ask Agent messages (Markdown removed), bookmark notes, title, tags and speakers. `Index.refresh()` re-reads
+only meetings whose files changed (`signature()`: size and time of meeting.json, the transcript, chat.json,
+bookmarks.json), so each search after the first is instant. `Query` turns the search box into folded terms
+(case and accents removed; `"phrases"`) plus filters, including typed ones (`from:`, `tag:`, `after:`,
+`before:`, `on:`, `in:`). A meeting matches when every term appears somewhere in it; the hits shown are the
+lines holding all terms or, if the terms are spread out, those holding the most. `spans()` maps matches back to
+the original text for highlighting (folding can change lengths). The window's Ctrl+F find bar uses the same
+matching (`plain_terms`, `spans`) on the open transcript.
 
 ## Speech models
 

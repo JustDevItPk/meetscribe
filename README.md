@@ -35,6 +35,11 @@ your computer.
   OpenRouter, Groq, Mistral or Together, or a free model running on your own computer with Ollama or LM Studio.
 - **Click a timestamp to hear that moment**, add bookmarks during the call (Ctrl+B), and edit the transcript
   in place (changes save automatically).
+- **Search every meeting** (Ctrl+Shift+F): what was said, Ask Agent answers, bookmark notes, titles and tags,
+  narrowed by people, tags and dates. Results open the meeting at the matching line. **Ctrl+F** finds words in
+  the open transcript.
+- **Tags** such as a client, project or kind of meeting, shown on the meetings list, which you can filter by
+  tag. Rename, merge or delete tags in **☰ → Manage tags…**.
 - **Transcribe again** with another model later. Earlier transcripts are kept as versions you can open and
   restore.
 - **Export** to Word, PDF or Markdown (summary, chat, bookmarks, transcript), or **one mixed MP3** of the
@@ -104,6 +109,9 @@ middle of a recording). To remove it, run `./uninstall.sh`. Your meetings and se
    own question (Enter sends, Shift+Enter starts a new line). The first time, MintoMeet helps you choose an
    AI agent if Claude Code isn't installed.
 4. **Export** from the header bar, or click **Transcribe again** to try another model on the saved audio.
+5. **Find it again later** with **Search** (Ctrl+Shift+F). Type words, or use the People, Tags and Date
+   buttons; filters can also be typed: `from:Priya tag:client after:2026-11-01 in:chat`, and `"quotes"` find an
+   exact phrase. Tag meetings with **Add tag** under the title, and filter the meetings list by tag.
 
 Add the people you meet with under **Speakers…** (name and optional email; the agent uses emails for
 follow-ups). Review and clean up their learned voices from **☰ → Learned voices…**.

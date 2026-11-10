@@ -18,7 +18,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
 import callwatch  # noqa: E402
 import agents  # noqa: E402
@@ -30,8 +31,11 @@ import migrate  # noqa: E402
 import modelcatalog  # noqa: E402
 import modellibrary  # noqa: E402
 import procstats  # noqa: E402
+import search  # noqa: E402
+import searchpage  # noqa: E402
 import speakers  # noqa: E402
 import storage  # noqa: E402
+import tagsui  # noqa: E402
 import tray  # noqa: E402
 import voicereview  # noqa: E402
 import voices  # noqa: E402
@@ -215,9 +219,15 @@ class Window(Adw.ApplicationWindow):
         self.viewing = None         # earlier transcript version shown read-only, or None for the current one
         self.export_dialog = None
         self.retx_dialog = None
+        self.find_matches = []      # (start, end) buffer offsets of the transcript find bar's matches
+        self.find_current = -1
+        self.find_timer = 0
+        self.chat_widgets = []      # one widget per Ask Agent message, to scroll to a search result
+        self.came_from_search = False
+        self.syncing_search = False
 
         provider = Gtk.CssProvider()
-        provider.load_from_string(CSS)
+        provider.load_from_string(CSS + tagsui.CSS + searchpage.CSS)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -236,7 +246,17 @@ class Window(Adw.ApplicationWindow):
         columns = Gtk.Box(spacing=18)
         for side in ("top", "bottom", "start", "end"):
             getattr(columns, f"set_margin_{side}")(16)
-        view.set_content(columns)
+        # the meeting view, or the Search page in its place
+        self.main_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.main_stack.add_named(columns, "meeting")
+        self.search_page = searchpage.SearchPage(
+            MEETINGS_DIR, open_hit=self.open_search_hit, open_meeting=self.open_search_meeting,
+            on_back=self.close_search,
+            extra_folders=lambda: [self.out_dir] if self.proc is not None and not self.retranscribing else [])
+        for side in ("top", "bottom", "start", "end"):
+            getattr(self.search_page, f"set_margin_{side}")(16)
+        self.main_stack.add_named(self.search_page, "search")
+        view.set_content(self.main_stack)
 
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_end=4)
         left.append(self.build_status_card())
@@ -286,10 +306,25 @@ class Window(Adw.ApplicationWindow):
                                            "then click a speaker name on a transcript line to say who spoke")
         self.speakers_btn.connect("clicked", lambda _b: self.open_speakers_dialog())
         header.pack_start(self.speakers_btn)
+        self.search_btn = Gtk.ToggleButton(child=self.icon_label("system-search-symbolic", "Search"))
+        self.search_btn.set_tooltip_text("Search every meeting: what was said, Ask Agent answers, bookmarks, "
+                                         "titles, tags, people and dates (Ctrl+Shift+F)")
+        self.search_btn.connect("toggled", self.on_search_toggled)
+        header.pack_start(self.search_btn)
+        self.results_btn = Gtk.Button(child=self.icon_label("go-previous-symbolic", "Back to results"), visible=False)
+        self.results_btn.add_css_class("flat")
+        self.results_btn.set_tooltip_text("Go back to your search results")
+        self.results_btn.connect("clicked", lambda _b: self.open_search(keep_place=True))
+        header.pack_start(self.results_btn)
+        for name, handler in (("search", lambda: self.open_search()), ("find", lambda: self.open_find())):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _a, _p, h=handler: h())
+            self.add_action(action)
 
         menu = Gio.Menu()
         menu.append("Speech models…", "win.models")
         menu.append("Learned voices…", "win.voices")
+        menu.append("Manage tags…", "win.tags")
         menu.append("Storage…", "win.storage")
         menu.append("Preferences", "app.preferences")
         menu.append("About MintoMeet", "app.about")
@@ -302,6 +337,9 @@ class Window(Adw.ApplicationWindow):
         voices_action = Gio.SimpleAction.new("voices", None)
         voices_action.connect("activate", lambda _a, _p: self.open_voice_review())
         self.add_action(voices_action)
+        tags_action = Gio.SimpleAction.new("tags", None)
+        tags_action.connect("activate", lambda _a, _p: self.open_manage_tags())
+        self.add_action(tags_action)
         storage_action = Gio.SimpleAction.new("storage", None)
         storage_action.connect("activate", lambda _a, _p: self.open_storage())
         self.add_action(storage_action)
@@ -335,6 +373,8 @@ class Window(Adw.ApplicationWindow):
         self.new_btn.set_tooltip_text("Clear the window, ready to record a new meeting")
         self.new_btn.connect("clicked", lambda _b: self.new_meeting())
         box.append(self.new_btn)
+        self.tag_filter = tagsui.TagFilter(on_changed=self.refresh_sidebar)
+        box.append(self.tag_filter)
         self.meeting_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.meeting_list.add_css_class("navigation-sidebar")
         self.meeting_list.connect("row-activated", self.on_meeting_row)
@@ -367,6 +407,9 @@ class Window(Adw.ApplicationWindow):
         self.size_label.add_css_class("size-note")
         tags.append(self.size_label)
         col.append(tags)
+        self.tag_editor = tagsui.TagEditor(MEETINGS_DIR, on_changed=lambda _f: self.refresh_sidebar(),
+                                           on_manage=self.open_manage_tags)
+        col.append(self.tag_editor)
         return col
 
     def build_title_row(self):
@@ -599,6 +642,8 @@ class Window(Adw.ApplicationWindow):
         self.t_buf.create_tag("speaker-link", underline=Pango.Underline.SINGLE)
         self.t_buf.create_tag("flash", background="#f6d32d")
         self.t_buf.create_tag("bulk", background="rgba(53,132,228,0.18)")
+        self.t_buf.create_tag("find", background="rgba(246,211,45,0.45)")
+        self.t_buf.create_tag("find-current", background="#ffa348", foreground="#000000")
         self.t_view = Gtk.TextView(buffer=self.t_buf, editable=False, cursor_visible=False,
                                    wrap_mode=Gtk.WrapMode.WORD_CHAR, pixels_below_lines=4)
         for side in ("top", "bottom", "left", "right"):
@@ -683,6 +728,7 @@ class Window(Adw.ApplicationWindow):
         bulk.append(assign)
         self.bulk_bar.set_child(bulk)
         t_page.append(self.bulk_bar)
+        t_page.append(self.build_find_bar())
         t_page.append(hint_row)
         t_page.append(self.play_box)
         t_page.append(self.t_stack)
@@ -698,6 +744,131 @@ class Window(Adw.ApplicationWindow):
         actions.append(self.ask_btn)
         t_page.append(actions)
         return t_page
+
+    def build_find_bar(self):
+        """Ctrl+F: find words in the open transcript, with every match highlighted and next / previous."""
+        self.find_bar = Gtk.SearchBar(show_close_button=True)
+        box = Gtk.Box(spacing=6)
+        self.find_entry = Gtk.SearchEntry(placeholder_text="Find in this transcript", width_chars=32)
+        self.find_entry.connect("search-changed", lambda _e: self.run_find())
+        self.find_entry.connect("activate", lambda _e: self.step_find(1))
+        self.find_entry.connect("next-match", lambda _e: self.step_find(1))
+        self.find_entry.connect("previous-match", lambda _e: self.step_find(-1))
+        self.find_entry.connect("stop-search", lambda _e: self.find_bar.set_search_mode(False))
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, key, _code, mods: key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                     and bool(mods & Gdk.ModifierType.SHIFT_MASK) and (self.step_find(-1) or True))
+        self.find_entry.add_controller(keys)
+        box.append(self.find_entry)
+        self.find_count = Gtk.Label(width_chars=12)
+        self.find_count.add_css_class("dim-label")
+        self.find_count.add_css_class("caption")
+        box.append(self.find_count)
+        for icon, step, tip in (("go-up-symbolic", -1, "Previous match (Shift+Enter)"),
+                                ("go-down-symbolic", 1, "Next match (Enter)")):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip)
+            b.add_css_class("flat")
+            b.connect("clicked", lambda _b, s=step: self.step_find(s))
+            box.append(b)
+        everywhere = Gtk.Button(label="Search all meetings")
+        everywhere.add_css_class("flat")
+        everywhere.set_tooltip_text("Look for these words in every meeting (Ctrl+Shift+F)")
+        everywhere.connect("clicked", lambda _b: self.open_search(self.find_entry.get_text()))
+        box.append(everywhere)
+        self.find_bar.set_child(box)
+        self.find_bar.connect_entry(self.find_entry)
+        self.find_bar.connect("notify::search-mode-enabled",
+                              lambda bar, _p: bar.get_search_mode() or self.clear_find())
+        return self.find_bar
+
+    def open_find(self, text=None, line=None):
+        """Show the find bar (with `text`), going to the first match at or after transcript `line`."""
+        if self.main_stack.get_visible_child_name() == "search":
+            self.search_page.entry.grab_focus()
+            return
+        self.stack.set_visible_child_name("transcript")
+        self.find_bar.set_search_mode(True)
+        if text is not None and text != self.find_entry.get_text():
+            self.find_entry.set_text(text)
+        self.run_find(line=line)
+        self.find_entry.grab_focus()
+        self.find_entry.set_position(-1)
+
+    def clear_find(self):
+        self.t_buf.remove_tag_by_name("find", self.t_buf.get_start_iter(), self.t_buf.get_end_iter())
+        self.t_buf.remove_tag_by_name("find-current", self.t_buf.get_start_iter(), self.t_buf.get_end_iter())
+        self.find_matches, self.find_current = [], -1
+        self.find_count.set_text("")
+
+    def run_find(self, line=None, scroll=True):
+        """Highlight every match of the find bar's words; select the one at `line`, near the last one, or
+        the first after the cursor."""
+        before = self.find_matches[self.find_current][0] if 0 <= self.find_current < len(self.find_matches) else None
+        self.clear_find()
+        terms = search.plain_terms(self.find_entry.get_text())
+        if not terms:
+            return
+        buf = self.t_buf
+        for n in range(buf.get_line_count()):
+            ok, start = buf.get_iter_at_line(n)
+            if not ok:
+                continue
+            end = start.copy()
+            if not end.ends_line():
+                end.forward_to_line_end()
+            off = start.get_offset()
+            for a, b in search.spans(buf.get_text(start, end, False), terms):
+                self.find_matches.append((off + a, off + b))
+                buf.apply_tag_by_name("find", buf.get_iter_at_offset(off + a), buf.get_iter_at_offset(off + b))
+        if not self.find_matches:
+            self.find_count.set_text("No matches")
+            return
+        if line is not None:
+            at = buf.get_iter_at_line(line)[1].get_offset()
+        elif before is not None:
+            at = before
+        else:
+            at = buf.get_iter_at_mark(buf.get_insert()).get_offset()
+        i = next((k for k, (a, _b) in enumerate(self.find_matches) if a >= at), 0)
+        self.select_find(i, scroll)
+
+    def select_find(self, i, scroll=True):
+        buf = self.t_buf
+        buf.remove_tag_by_name("find-current", buf.get_start_iter(), buf.get_end_iter())
+        if not self.find_matches:
+            return
+        self.find_current = i % len(self.find_matches)
+        a, b = self.find_matches[self.find_current]
+        buf.apply_tag_by_name("find-current", buf.get_iter_at_offset(a), buf.get_iter_at_offset(b))
+        self.find_count.set_text(f"{self.find_current + 1} of {len(self.find_matches)}")
+        if scroll:
+            self.scroll_transcript_to(buf.get_iter_at_offset(a))
+
+    def scroll_transcript_to(self, it):
+        """Scroll so `it` shows in the upper part of the transcript. Through a mark, because right after a
+        meeting loads the lines aren't measured yet and scroll_to_iter would land in the wrong place."""
+        mark = self.t_buf.get_mark("search-target") or self.t_buf.create_mark("search-target", it, True)
+        self.t_buf.move_mark(mark, it)
+        self.t_view.scroll_to_mark(mark, 0.1, True, 0.0, 0.35)
+
+    def step_find(self, step):
+        if self.find_matches:
+            self.select_find(self.find_current + step)
+        elif self.find_entry.get_text():
+            self.run_find()
+
+    def schedule_find(self):
+        """Re-highlight after the transcript changed (new live lines, edits), without jumping around."""
+        bar = getattr(self, "find_bar", None)
+        if bar is None or not bar.get_search_mode() or self.find_timer:
+            return
+
+        def again():
+            self.find_timer = 0
+            if self.find_bar.get_search_mode():
+                self.run_find(scroll=False)
+            return False
+        self.find_timer = GLib.timeout_add(400, again)
 
     def build_chat_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1022,6 +1193,7 @@ class Window(Adw.ApplicationWindow):
             return
         self.flush_transcript_save()
         self.stop_playback()
+        self.close_search()
         cfg = self.current_settings()
         self.settings_expander.set_expanded(False)
         if not cfg["system"] and not cfg["mic"]:
@@ -1278,6 +1450,9 @@ class Window(Adw.ApplicationWindow):
         live = self.out_dir if self.proc is not None and not self.retranscribing else None
         if live is not None and live not in folders:
             folders.insert(0, live)
+        self.tag_filter.set_tags(meetings.count_tags(meetings.tags(f) for f in folders))
+        every = len(folders)
+        folders = [f for f in folders if f == live or self.tag_filter.accepts(f)]
         for folder in folders:
             row = Gtk.ListBoxRow()
             row.folder = folder
@@ -1293,6 +1468,9 @@ class Window(Adw.ApplicationWindow):
             info.add_css_class("caption")
             texts.append(name)
             texts.append(info)
+            tags = meetings.tags(folder)
+            if tags:
+                texts.append(tagsui.pill_row(tags, matches=[t for t in tags if t.casefold() in self.tag_filter.selected]))
             box.append(texts)
             trash = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
             trash.add_css_class("flat")
@@ -1305,6 +1483,8 @@ class Window(Adw.ApplicationWindow):
             self.meeting_list.append(row)
             if self.out_dir is not None and folder == self.out_dir:
                 self.meeting_list.select_row(row)
+        self.meeting_empty.set_label("No meetings have all the chosen tags." if every and not folders else
+                                     "Your recorded meetings will appear here.")
         self.meeting_empty.set_visible(not folders)
         self.update_size_summary()
 
@@ -1313,6 +1493,7 @@ class Window(Adw.ApplicationWindow):
             self.toast("Stop the recording first.")
             return
         self.load_folder(row.folder)
+        self.close_search()
         if self.split.get_collapsed():
             self.split.set_show_sidebar(False)
 
@@ -1344,6 +1525,7 @@ class Window(Adw.ApplicationWindow):
             return
         self.flush_transcript_save()
         self.stop_playback()
+        self.close_search()
         self.leave_version()
         self.out_dir = None
         self.chat = None
@@ -1363,6 +1545,14 @@ class Window(Adw.ApplicationWindow):
 
     def update_title(self):
         self.title_label.set_text(meetings.title(self.out_dir) if self.out_dir is not None else "New meeting")
+        if self.tag_editor.folder != self.out_dir:
+            self.tag_editor.set_folder(self.out_dir)
+
+    def open_manage_tags(self):
+        def changed():
+            self.tag_editor.set_folder(self.out_dir)
+            self.refresh_sidebar()
+        tagsui.ManageTagsDialog(MEETINGS_DIR, on_changed=changed).present(self)
 
     def on_title_editing(self, label, _param):
         if label.get_editing() or self.out_dir is None:
@@ -1686,6 +1876,7 @@ class Window(Adw.ApplicationWindow):
                    "earlier version.")
 
     def on_transcript_edited(self, _buf):
+        self.schedule_find()        # offsets moved: highlight the find bar's matches again
         if self.loading_transcript or not self.t_view.get_editable():
             return
         self.save_status.set_text("Saving…")
@@ -1910,12 +2101,30 @@ class Window(Adw.ApplicationWindow):
 
     def render_chat(self):
         self.clear_chat_view()
+        self.chat_widgets = []
         for m in self.chat.messages if self.chat else []:
             if m["role"] == "user":
                 self.add_user_bubble(m["text"])
             else:
                 set_markdown(self.add_assistant_bubble(m["text"], m.get("agent") or chat.CLAUDE), m["text"])
+            self.chat_widgets.append(self.msg_box.get_last_child())
         self.refresh_buttons()
+
+    def scroll_to_message(self, index):
+        """Show Ask Agent message `index` (as in chat.json), briefly highlighted."""
+        self.stack.set_visible_child_name("chat")
+        if not 0 <= index < len(self.chat_widgets):
+            return
+        widget = self.chat_widgets[index]
+
+        def go():
+            ok, point = widget.compute_point(self.msg_box, Graphene.Point())
+            if ok:
+                self.c_scroll.get_vadjustment().set_value(max(0, point.y - 12))
+            widget.add_css_class("search-flash")
+            GLib.timeout_add(2500, lambda: widget.remove_css_class("search-flash") or False)
+            return False
+        GLib.timeout_add(150, go)       # after the chat has been laid out (and scroll_chat has run)
 
     def add_user_bubble(self, text):
         label = Gtk.Label(label=text, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, xalign=0, selectable=True,
@@ -2892,6 +3101,89 @@ class Window(Adw.ApplicationWindow):
         self.refresh_sidebar()
         return True
 
+    # --- search across meetings ------------------------------------
+    def set_search_button(self, on):
+        if self.search_btn.get_active() != on:
+            self.syncing_search = True
+            self.search_btn.set_active(on)
+            self.syncing_search = False
+
+    def on_search_toggled(self, btn):
+        if not self.syncing_search:
+            self.open_search() if btn.get_active() else self.close_search()
+
+    def open_search(self, text=None, keep_place=False):
+        self.flush_transcript_save()        # so the search sees your latest edits
+        self.main_stack.set_visible_child_name("search")
+        self.set_search_button(True)
+        self.results_btn.set_visible(False)
+        self.search_page.present_search(text, keep_place=keep_place)
+
+    def close_search(self):
+        self.main_stack.set_visible_child_name("meeting")
+        self.set_search_button(False)
+        self.came_from_search = False
+        self.results_btn.set_visible(False)
+
+    def open_search_meeting(self, doc, query):
+        self.go_to_result(doc, query)
+
+    def open_search_hit(self, doc, hit, query):
+        self.go_to_result(doc, query, hit)
+
+    def go_to_result(self, doc, query, hit=None):
+        """Open a search result's meeting and show the match: the transcript line (with the find bar on the
+        searched words), the bookmark, or the Ask Agent message."""
+        folder = doc.folder
+        if self.proc is not None and folder != self.out_dir:
+            self.toast("Stop the recording first, then you can open other meetings.")
+            return
+        if folder != self.out_dir or self.viewing is not None:
+            if not self.load_folder(folder):
+                return
+        self.main_stack.set_visible_child_name("meeting")
+        self.set_search_button(False)
+        self.came_from_search = True
+        self.results_btn.set_visible(True)
+        words = " ".join(f'"{t}"' if " " in t else t for t in query.terms)
+        if hit is None or hit.source == "transcript":
+            line = self.find_line(hit.when, hit.text) if hit is not None else None
+            if words:
+                self.open_find(words, line=line if line is not None else 0)
+            else:
+                self.find_bar.set_search_mode(False)
+                self.stack.set_visible_child_name("transcript")
+            if line is not None:
+                self.flash_line(line)
+        elif hit.source == "bookmark":
+            self.find_bar.set_search_mode(False)
+            self.jump_to(doc.bookmarks[hit.index].get("t", 0))
+        else:
+            self.find_bar.set_search_mode(False)
+            self.scroll_to_message(hit.index)
+
+    def find_line(self, stamp, text):
+        """The transcript line with this time and text (or, failing that, the first at this time)."""
+        first = None
+        for n in range(self.t_buf.get_line_count()):
+            info = self.line_info(n)
+            if info is None or info[2].group(1) != stamp:
+                continue
+            if info[2].group(3).strip() == text.strip():
+                return n
+            first = n if first is None else first
+        return first
+
+    def flash_line(self, n):
+        start = self.t_buf.get_iter_at_line(n)[1]
+        end = start.copy()
+        if not end.ends_line():
+            end.forward_to_line_end()
+        self.t_buf.apply_tag_by_name("flash", start, end)
+        self.scroll_transcript_to(start)
+        GLib.timeout_add(2500, lambda: self.t_buf.remove_tag_by_name(
+            "flash", self.t_buf.get_start_iter(), self.t_buf.get_end_iter()) or False)
+
     # --- closing ---------------------------------------------------
     def on_close_request(self, _win):
         self.flush_transcript_save()
@@ -2950,6 +3242,8 @@ class App(Adw.Application):
         self.set_accels_for_action("app.bookmark", ["<Control>b"])
         self.set_accels_for_action("app.preferences", ["<Control>comma"])
         self.set_accels_for_action("app.quit", ["<Control>q"])
+        self.set_accels_for_action("win.search", ["<Control><Shift>f", "<Control>k"])
+        self.set_accels_for_action("win.find", ["<Control>f"])
 
     def do_activate(self):
         if self.win is None:
