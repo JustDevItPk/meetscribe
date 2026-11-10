@@ -5,6 +5,8 @@ All notable changes to MintoMeet are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
 ### Added
 - **Transcription runs in the background.** The window stays usable while meetings are transcribed: open and
   edit other meetings, chat, export or start a new recording. Stopping a recording frees the window at once and
@@ -88,5 +90,6 @@ First public release.
 - `install.sh` checks for libadwaita 1.6+, supports x86_64 and ARM64, and installs pinned engine versions;
   new `uninstall.sh`; `mintomeet --version` and an About window.
 
-[Unreleased]: https://github.com/JustDevItPk/mintomeet/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/JustDevItPk/mintomeet/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/JustDevItPk/mintomeet/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/JustDevItPk/mintomeet/releases/tag/v0.1.0
