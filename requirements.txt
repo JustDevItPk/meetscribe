@@ -2,5 +2,5 @@
 # (~/.local/share/mintomeet/venv). The window itself runs on the system Python with GTK 4 + libadwaita.
 faster-whisper>=1.1,<2
 sherpa-onnx>=1.12,<3
-python-docx>=1.1,<2
+python-docx>=1.2.0,<2
 fpdf2>=2.8,<3
